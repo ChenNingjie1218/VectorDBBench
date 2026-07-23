@@ -16,18 +16,13 @@ from .config import SPFreshBuildMode, TiDBIndexConfig
 log = logging.getLogger(__name__)
 
 SPFRESH_OPTIMIZE_TIMEOUT_SECONDS = float(os.environ.get("SPFRESH_OPTIMIZE_TIMEOUT_SECONDS", "600.0"))
-SPFRESH_REGISTRATION_TIMEOUT_SECONDS = 30.0
 SPFRESH_POLL_INTERVAL_SECONDS = 1.0
-SPFRESH_INDEX_STATE_NEEDS_REBUILD = "NEEDS_REBUILD"
-SPFRESH_INDEX_STATE_UNKNOWN = "UNKNOWN"
 MAX_ALLOWED_PACKET_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
 class SPFreshIndexStatus:
     applied_base_ts: int | None
-    index_state: str | None
-    is_ready: bool
     lag_seconds: int | None
     owner_lease_expire_ts: int | None
     observed_at: Any
@@ -249,7 +244,7 @@ class TiDB(VectorDB):
     def _fetch_spfresh_index_status(self) -> SPFreshIndexStatus | None:
         self.cursor.execute(
             """
-            SELECT applied_base_ts, index_state, is_ready, lag_seconds, owner_lease_expire_ts, observed_at
+            SELECT applied_base_ts, lag_seconds, owner_lease_expire_ts, observed_at
             FROM information_schema.TIDB_SPFRESH_INDEX_STATUS
             WHERE table_schema = DATABASE() AND table_name = %s AND index_name = %s
             """,
@@ -260,88 +255,63 @@ class TiDB(VectorDB):
             return None
         return SPFreshIndexStatus(
             applied_base_ts=None if row[0] is None else int(row[0]),
-            index_state=None if row[1] is None else str(row[1]).upper(),
-            is_ready=bool(row[2]),
-            lag_seconds=None if row[3] is None else int(row[3]),
-            owner_lease_expire_ts=None if row[4] is None else int(row[4]),
-            observed_at=row[5],
+            lag_seconds=None if row[1] is None else int(row[1]),
+            owner_lease_expire_ts=None if row[2] is None else int(row[2]),
+            observed_at=row[3],
         )
 
     def _wait_for_spfresh_ready(
         self,
         barrier_ts: int,
         timeout_seconds: float = SPFRESH_OPTIMIZE_TIMEOUT_SECONDS,
-        registration_timeout_seconds: float = SPFRESH_REGISTRATION_TIMEOUT_SECONDS,
         poll_interval_seconds: float = SPFRESH_POLL_INTERVAL_SECONDS,
     ) -> None:
         deadline = time.monotonic() + timeout_seconds
-        registration_deadline = time.monotonic() + min(timeout_seconds, registration_timeout_seconds)
         last_observed = None
 
-        while True:
-            now = time.monotonic()
-            if now > deadline:
-                msg = (
-                    f"Timed out waiting for TiDB/SPFresh status catch-up to barrier_ts={barrier_ts}; "
-                    f"last_observed={last_observed}"
-                )
-                raise RuntimeError(msg)
-
+        while time.monotonic() < deadline:
             status = self._fetch_spfresh_index_status()
-            if status is None:
-                if now > registration_deadline:
-                    msg = (
-                        f"TiDB/SPFresh status row never appeared for table={self.table_name} "
-                        f"index={self._spfresh_index_name()} before barrier_ts={barrier_ts}"
+            if status is not None:
+                last_observed = {
+                    "applied_base_ts": status.applied_base_ts,
+                    "lag_seconds": status.lag_seconds,
+                    "owner_lease_expire_ts": status.owner_lease_expire_ts,
+                    "observed_at": status.observed_at,
+                }
+
+            now = time.monotonic()
+            if now >= deadline:
+                break
+
+            if status is not None:
+                if status.applied_base_ts is not None and status.applied_base_ts >= barrier_ts:
+                    log.info(
+                        "TiDB/SPFresh status reached barrier_ts=%s applied_base_ts=%s "
+                        "lag_seconds=%s owner_lease_expire_ts=%s observed_at=%s",
+                        barrier_ts,
+                        status.applied_base_ts,
+                        status.lag_seconds,
+                        status.owner_lease_expire_ts,
+                        status.observed_at,
                     )
-                    raise RuntimeError(msg)
-                time.sleep(poll_interval_seconds)
-                continue
+                    return
 
-            last_observed = {
-                "applied_base_ts": status.applied_base_ts,
-                "index_state": status.index_state,
-                "is_ready": int(status.is_ready),
-                "lag_seconds": status.lag_seconds,
-                "owner_lease_expire_ts": status.owner_lease_expire_ts,
-                "observed_at": status.observed_at,
-            }
-            if status.index_state == SPFRESH_INDEX_STATE_UNKNOWN:
-                msg = f"TiDB/SPFresh status became UNKNOWN while waiting for barrier_ts={barrier_ts}: {last_observed}"
-                raise RuntimeError(msg)
-            if status.index_state == SPFRESH_INDEX_STATE_NEEDS_REBUILD:
-                msg = (
-                    f"TiDB/SPFresh index entered NEEDS_REBUILD while waiting for barrier_ts={barrier_ts}: "
-                    f"{last_observed}"
-                )
-                raise RuntimeError(msg)
-
-            if status.applied_base_ts is not None and status.applied_base_ts >= barrier_ts and status.is_ready:
                 log.info(
-                    "TiDB/SPFresh status reached barrier_ts=%s applied_base_ts=%s is_ready=%s "
-                    "lag_seconds=%s owner_lease_expire_ts=%s observed_at=%s index_state=%s",
+                    "TiDB/SPFresh status catch-up pending: barrier_ts=%s applied_base_ts=%s "
+                    "lag_seconds=%s owner_lease_expire_ts=%s observed_at=%s",
                     barrier_ts,
                     status.applied_base_ts,
-                    int(status.is_ready),
                     status.lag_seconds,
                     status.owner_lease_expire_ts,
                     status.observed_at,
-                    status.index_state,
                 )
-                return
+            time.sleep(min(poll_interval_seconds, deadline - now))
 
-            log.info(
-                "TiDB/SPFresh status catch-up pending: barrier_ts=%s applied_base_ts=%s "
-                "is_ready=%s lag_seconds=%s owner_lease_expire_ts=%s observed_at=%s index_state=%s",
-                barrier_ts,
-                status.applied_base_ts,
-                int(status.is_ready),
-                status.lag_seconds,
-                status.owner_lease_expire_ts,
-                status.observed_at,
-                status.index_state,
-            )
-            time.sleep(poll_interval_seconds)
+        msg = (
+            f"Timed out waiting for TiDB/SPFresh status catch-up to barrier_ts={barrier_ts}; "
+            f"last_observed={last_observed}"
+        )
+        raise RuntimeError(msg)
 
     def wait_spfresh_post_delete_catchup(
         self,
