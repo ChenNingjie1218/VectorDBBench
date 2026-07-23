@@ -364,7 +364,7 @@ class TestTiDBSPFresh:
         sql, _ = tidb.cursor.execute_calls[0]
         assert "ALTER TABLE vector_bench_test ADD VECTOR INDEX idx_embedding_spfresh_l2" in sql
         assert "VECTOR_INDEX_PARAM 'min_partition_size=32,max_partition_size=256,write_beam_size=8'" in sql
-        assert result.optimize_duration == 3.5
+        assert result.optimize_duration == 0.0
         assert result.spfresh_build_duration == 3.5
         assert result.spfresh_incremental_catchup_duration == 0.0
         assert tidb.conn.committed is True
@@ -398,6 +398,23 @@ class TestTiDBSPFresh:
             tidb.optimize()
 
         wait_mock.assert_called_once_with(barrier_ts=123456)
+
+    def test_incremental_catchup_records_only_checkpoint_wait_duration(self):
+        tidb = make_tidb()
+        tidb._max_insert_commit_ts = 123456
+        tidb.cursor = FakeCursor()
+        tidb.conn = FakeConnection()
+
+        with (
+            patch.object(tidb, "_wait_for_spfresh_ready") as wait_mock,
+            patch("vectordb_bench.backend.clients.tidb.tidb.time.perf_counter", side_effect=[10.0, 11.5]),
+        ):
+            result = tidb.wait_spfresh_incremental_catchup()
+
+        wait_mock.assert_called_once_with(barrier_ts=123456)
+        assert result.spfresh_incremental_catchup_duration == 1.5
+        assert result.spfresh_build_duration == 0.0
+        assert result.optimize_duration == 0.0
 
     def test_load_train_data_restores_tidb_load_state_from_insert_runner(self):
         class FakeDB:

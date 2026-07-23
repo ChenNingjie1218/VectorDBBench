@@ -246,21 +246,30 @@ class CaseRunner(BaseModel):
         else:
             self._run_standard_load_stage(metric)
 
-        log.info(
-            f"Finish loading the entire dataset into VectorDB,"
-            f" insert_duration={metric.insert_duration}, optimize_duration={metric.optimize_duration}"
-            f" load_duration(insert + optimize) = {metric.load_duration}"
-        )
+        if self._tidb_spfresh_build_mode() is not None:
+            log.info(
+                "Finish loading the entire dataset into VectorDB, insert_duration=%s, "
+                "spfresh_build_duration=%s, spfresh_incremental_catchup_duration=%s, load_duration=%s",
+                metric.insert_duration,
+                metric.spfresh_build_duration,
+                metric.spfresh_incremental_catchup_duration,
+                metric.load_duration,
+            )
+        else:
+            log.info(
+                "Finish loading the entire dataset into VectorDB, insert_duration=%s, "
+                "optimize_duration=%s, load_duration(insert + optimize)=%s",
+                metric.insert_duration,
+                metric.optimize_duration,
+                metric.load_duration,
+            )
 
     def _run_standard_load_stage(self, metric: Metric) -> None:
         load_start = time.perf_counter()
         _, load_dur = self._load_train_data()
         optimize_result = self._coerce_optimize_result(self._optimize())
-        if self._is_tidb_spfresh_inline_load():
-            incremental_catchup_dur = time.perf_counter() - load_start
-            optimize_result.spfresh_incremental_catchup_duration = incremental_catchup_dur
-            optimize_result.optimize_duration = optimize_result.spfresh_build_duration + incremental_catchup_dur
-            load_duration = optimize_result.optimize_duration
+        if self._tidb_spfresh_build_mode() is not None:
+            load_duration = time.perf_counter() - load_start
         else:
             load_duration = load_dur + optimize_result.optimize_duration
 
@@ -271,7 +280,13 @@ class CaseRunner(BaseModel):
     def _run_perf_build_only_stage(self, metric: Metric) -> None:
         build_result = self._optimize()
         self._record_optimize_result(metric, build_result)
-        log.info(f"Finish building VectorDB index, optimize_duration={metric.optimize_duration}")
+        if self._tidb_spfresh_build_mode() is not None:
+            log.info(
+                "Finish building VectorDB index, spfresh_build_duration=%s",
+                metric.spfresh_build_duration,
+            )
+        else:
+            log.info("Finish building VectorDB index, optimize_duration=%s", metric.optimize_duration)
 
     def _run_perf_delete_stage(self, metric: Metric) -> None:
         _, delete_dur = self._delete_data()
@@ -341,9 +356,6 @@ class CaseRunner(BaseModel):
         mode = getattr(db_case_config, "spfresh_build_mode", "inline")
         return getattr(mode, "value", mode)
 
-    def _is_tidb_spfresh_inline_load(self) -> bool:
-        return self._tidb_spfresh_build_mode() == "inline"
-
     def _is_tidb_spfresh_split_load(self) -> bool:
         return self._tidb_spfresh_build_mode() == "split"
 
@@ -376,31 +388,23 @@ class CaseRunner(BaseModel):
     def _run_spfresh_split_load(self, metric: Metric) -> None:
         base_count, delta_count = self._spfresh_split_counts()
 
+        load_start = time.perf_counter()
         _, base_insert_dur = self._load_train_data(limit=base_count)
         build_result = self._coerce_optimize_result(self._build_spfresh_index())
 
-        delta_start = time.perf_counter()
         _, delta_insert_dur = self._load_train_data(start_offset=base_count, limit=delta_count)
         wait_result = self._coerce_optimize_result(self._wait_spfresh_incremental_catchup())
-        incremental_catchup_dur = time.perf_counter() - delta_start
+        load_duration = time.perf_counter() - load_start
 
         spfresh_build_dur = build_result.spfresh_build_duration
-        optimize_dur = spfresh_build_dur + incremental_catchup_dur
+        incremental_catchup_dur = wait_result.spfresh_incremental_catchup_duration
 
         metric.spfresh_base_insert_duration = round(base_insert_dur, 4)
         metric.spfresh_delta_insert_duration = round(delta_insert_dur, 4)
         metric.insert_duration = round(base_insert_dur + delta_insert_dur, 4)
         metric.spfresh_build_duration = round(spfresh_build_dur, 4)
         metric.spfresh_incremental_catchup_duration = round(incremental_catchup_dur, 4)
-        metric.optimize_duration = round(optimize_dur, 4)
-        metric.load_duration = round(base_insert_dur + optimize_dur, 4)
-
-        if wait_result.spfresh_incremental_catchup_duration:
-            log.info(
-                "SPFRESH split post-insert wait duration=%s, end-to-end incremental catch-up duration=%s",
-                wait_result.spfresh_incremental_catchup_duration,
-                incremental_catchup_dur,
-            )
+        metric.load_duration = round(load_duration, 4)
 
     @utils.time_it
     def _load_train_data(self, start_offset: int = 0, limit: int | None = None):

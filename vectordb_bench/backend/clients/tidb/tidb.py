@@ -133,7 +133,6 @@ class TiDB(VectorDB):
         self._create_spfresh_index()
         build_duration = time.perf_counter() - start
         return OptimizeResult(
-            optimize_duration=build_duration,
             spfresh_build_duration=build_duration,
         )
 
@@ -160,7 +159,6 @@ class TiDB(VectorDB):
         catchup_duration = time.perf_counter() - start
         self._max_insert_commit_ts = None
         return OptimizeResult(
-            optimize_duration=catchup_duration,
             spfresh_incremental_catchup_duration=catchup_duration,
         )
 

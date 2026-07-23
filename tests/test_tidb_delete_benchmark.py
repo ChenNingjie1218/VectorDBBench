@@ -505,7 +505,36 @@ def test_case_runner_perf_case_runs_build_only_stage():
     assert metric.optimize_duration == 1.2346
 
 
-def test_case_runner_inline_spfresh_catchup_duration_starts_before_insert():
+def test_case_runner_tidb_spfresh_build_only_records_build_without_optimize():
+    case_runner = CaseRunner.construct(
+        run_id="run",
+        config=SimpleNamespace(
+            db=DB.TiDB,
+            db_case_config=TiDBIndexConfig(
+                metric_type=MetricType.COSINE,
+                spfresh_build_mode="non-inline",
+            ),
+            stages=[TaskStage.BUILD],
+        ),
+        ca=SimpleNamespace(dataset=None),
+        status=None,
+        dataset_source=None,
+        db=None,
+    )
+    object.__setattr__(
+        case_runner,
+        "_optimize",
+        lambda: OptimizeResult(spfresh_build_duration=3.0),
+    )
+
+    metric = case_runner._run_perf_case(drop_old=False)
+
+    assert metric.spfresh_build_duration == 3.0
+    assert metric.spfresh_incremental_catchup_duration == 0.0
+    assert metric.optimize_duration == 0.0
+
+
+def test_case_runner_inline_spfresh_records_post_insert_catchup_wait():
     case_runner = CaseRunner.construct(
         run_id="run",
         config=SimpleNamespace(
@@ -522,7 +551,7 @@ def test_case_runner_inline_spfresh_catchup_duration_starts_before_insert():
     object.__setattr__(
         case_runner,
         "_optimize",
-        lambda: OptimizeResult(optimize_duration=1.0, spfresh_incremental_catchup_duration=1.0),
+        lambda: OptimizeResult(spfresh_incremental_catchup_duration=1.0),
     )
 
     with patch("vectordb_bench.backend.task_runner.time.perf_counter", side_effect=[10.0, 17.0]):
@@ -530,8 +559,8 @@ def test_case_runner_inline_spfresh_catchup_duration_starts_before_insert():
 
     assert metric.insert_duration == 4.0
     assert metric.spfresh_build_duration == 0.0
-    assert metric.spfresh_incremental_catchup_duration == 7.0
-    assert metric.optimize_duration == 7.0
+    assert metric.spfresh_incremental_catchup_duration == 1.0
+    assert metric.optimize_duration == 0.0
     assert metric.load_duration == 7.0
 
 
@@ -555,19 +584,20 @@ def test_case_runner_non_inline_spfresh_records_only_build_duration():
     object.__setattr__(
         case_runner,
         "_optimize",
-        lambda: OptimizeResult(optimize_duration=3.0, spfresh_build_duration=3.0),
+        lambda: OptimizeResult(spfresh_build_duration=3.0),
     )
 
-    metric = case_runner._run_perf_case(drop_old=True)
+    with patch("vectordb_bench.backend.task_runner.time.perf_counter", side_effect=[10.0, 18.0]):
+        metric = case_runner._run_perf_case(drop_old=True)
 
     assert metric.insert_duration == 4.0
     assert metric.spfresh_build_duration == 3.0
     assert metric.spfresh_incremental_catchup_duration == 0.0
-    assert metric.optimize_duration == 3.0
-    assert metric.load_duration == 7.0
+    assert metric.optimize_duration == 0.0
+    assert metric.load_duration == 8.0
 
 
-def test_case_runner_split_spfresh_records_catchup_from_delta_insert_start():
+def test_case_runner_split_spfresh_records_post_delta_catchup_wait():
     case_runner = CaseRunner.construct(
         run_id="run",
         config=SimpleNamespace(
@@ -595,16 +625,16 @@ def test_case_runner_split_spfresh_records_catchup_from_delta_insert_start():
     object.__setattr__(
         case_runner,
         "_build_spfresh_index",
-        lambda: OptimizeResult(optimize_duration=3.0, spfresh_build_duration=3.0),
+        lambda: OptimizeResult(spfresh_build_duration=3.0),
     )
     object.__setattr__(
         case_runner,
         "_wait_spfresh_incremental_catchup",
-        lambda: OptimizeResult(optimize_duration=1.0, spfresh_incremental_catchup_duration=1.0),
+        lambda: OptimizeResult(spfresh_incremental_catchup_duration=1.0),
     )
 
     metric = Metric()
-    with patch("vectordb_bench.backend.task_runner.time.perf_counter", side_effect=[10.0, 18.0]):
+    with patch("vectordb_bench.backend.task_runner.time.perf_counter", side_effect=[10.0, 25.0]):
         case_runner._run_spfresh_split_load(metric)
 
     assert load_calls == [(0, 80), (80, 20)]
@@ -612,8 +642,8 @@ def test_case_runner_split_spfresh_records_catchup_from_delta_insert_start():
     assert metric.spfresh_delta_insert_duration == 2.0
     assert metric.insert_duration == 6.0
     assert metric.spfresh_build_duration == 3.0
-    assert metric.spfresh_incremental_catchup_duration == 8.0
-    assert metric.optimize_duration == 11.0
+    assert metric.spfresh_incremental_catchup_duration == 1.0
+    assert metric.optimize_duration == 0.0
     assert metric.load_duration == 15.0
 
 
