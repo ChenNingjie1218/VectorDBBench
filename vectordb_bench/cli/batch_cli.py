@@ -1,7 +1,6 @@
 import logging
 import time
 from collections.abc import MutableMapping
-from concurrent.futures import wait
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
@@ -114,11 +113,6 @@ def BatchCli():
     for args in args_arr:
         result = runner.invoke(cli, args)
         time.sleep(5)
-
-        from ..interface import global_result_future
-
-        if global_result_future:
-            wait([global_result_future])
 
         if result.exception:
             log.exception(f"failed to run sub command: {args[0]}", exc_info=result.exception)

@@ -29,8 +29,6 @@ from .models import (
 
 log = logging.getLogger(__name__)
 
-global_result_future: concurrent.futures.Future | None = None
-
 
 class SIGNAL(Enum):
     SUCCESS = 0
@@ -41,6 +39,9 @@ class SIGNAL(Enum):
 class BenchMarkRunner:
     def __init__(self):
         self.running_task: TaskRunner | None = None
+        self.executor: concurrent.futures.ProcessPoolExecutor | None = None
+        self.result_future: concurrent.futures.Future | None = None
+        self.receive_conn: Connection | None = None
         self.latest_error: str | None = None
         self.drop_old: bool = True
         # set default data source by ENV
@@ -111,16 +112,13 @@ class BenchMarkRunner:
             log.debug(f"Sigal received to process: {sig}, {received}")
             if sig == SIGNAL.ERROR:
                 self.latest_error = received
-                self._clear_running_task()
+                self.shutdown(cancel=False)
             elif sig == SIGNAL.SUCCESS:
-                global global_result_future
-                global_result_future = None
-                self.running_task = None
-                self.receive_conn = None
+                self.shutdown(cancel=False)
             elif sig == SIGNAL.WIP:
                 self.running_task.set_finished(received)
             else:
-                self._clear_running_task()
+                self.shutdown(cancel=True)
 
     def has_running(self) -> bool:
         """check if there're running benchmarks"""
@@ -130,7 +128,7 @@ class BenchMarkRunner:
 
     def stop_running(self):
         """force stop if ther're running benchmarks"""
-        self._clear_running_task()
+        self.shutdown(cancel=True)
 
     def get_tasks_count(self) -> int:
         """the count of all tasks"""
@@ -146,21 +144,21 @@ class BenchMarkRunner:
             return -1
         return self.running_task.num_finished()
 
-    def _sync_running_task(self):
-        if not self.running_task:
-            return
-
-        global global_result_future
+    def wait(self) -> None:
+        """Wait for the submitted benchmark and release its worker process."""
         try:
-            if global_result_future:
-                global_result_future.result()
+            if self.result_future:
+                self.result_future.result()
         except Exception as e:
             log.warning(f"task running failed: {e}", exc_info=True)
         finally:
-            global_result_future = None
-            self.running_task = None
+            self.shutdown(cancel=False)
 
-    def _async_task_v2(self, running_task: TaskRunner, send_conn: Connection) -> None:
+    def _sync_running_task(self):
+        self.wait()
+
+    @staticmethod
+    def _async_task_v2(running_task: TaskRunner, send_conn: Connection, drop_old_tasks: bool) -> None:
         try:
             if not running_task:
                 return
@@ -174,7 +172,7 @@ class BenchMarkRunner:
                 )
 
                 drop_old = TaskStage.DROP_OLD in runner.config.stages
-                if (latest_runner and runner == latest_runner) or not self.drop_old:
+                if (latest_runner and runner == latest_runner) or not drop_old_tasks:
                     drop_old = False
                 num_cases = running_task.num_cases()
                 try:
@@ -232,9 +230,6 @@ class BenchMarkRunner:
             return
 
     def _clear_running_task(self):
-        global global_result_future
-        global_result_future = None
-
         if self.running_task:
             log.info(f"will force stop running task: {self.running_task.run_id}")
             for r in self.running_task.case_runners:
@@ -247,17 +242,37 @@ class BenchMarkRunner:
             self.receive_conn.close()
             self.receive_conn = None
 
+    def shutdown(self, *, cancel: bool) -> None:
+        """Idempotently stop benchmark work and release the process pool."""
+        if cancel:
+            self._clear_running_task()
+
+        executor = self.executor
+        self.executor = None
+        self.result_future = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        self.running_task = None
+        if self.receive_conn is not None:
+            self.receive_conn.close()
+            self.receive_conn = None
+
     def _run_async(self, conn: Connection) -> bool:
         log.info(
             f"task submitted: id={self.running_task.run_id}, {self.running_task.task_label}, "
             f"case number: {len(self.running_task.case_runners)}"
         )
-        global global_result_future
-        executor = concurrent.futures.ProcessPoolExecutor(
+        self.executor = concurrent.futures.ProcessPoolExecutor(
             max_workers=1,
             mp_context=mp.get_context("spawn"),
         )
-        global_result_future = executor.submit(self._async_task_v2, self.running_task, conn)
+        self.result_future = self.executor.submit(
+            self._async_task_v2,
+            self.running_task,
+            conn,
+            self.drop_old,
+        )
 
         return True
 

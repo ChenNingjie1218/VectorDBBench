@@ -1,5 +1,7 @@
-import time
 import logging
+import time
+from unittest.mock import Mock, patch
+
 from vectordb_bench.interface import BenchMarkRunner
 from vectordb_bench.models import (
     DB, IndexType, CaseType, TaskConfig, CaseConfig,
@@ -8,6 +10,31 @@ from vectordb_bench.models import (
 log = logging.getLogger(__name__)
 
 class TestBenchRunner:
+    def test_wait_shuts_down_executor(self):
+        runner = BenchMarkRunner()
+        runner.running_task = Mock()
+        result_future = runner.result_future = Mock()
+        executor = runner.executor = Mock()
+
+        runner.wait()
+
+        result_future.result.assert_called_once_with()
+        executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+        assert runner.running_task is None
+
+    def test_shutdown_cancels_running_task_before_executor(self):
+        runner = BenchMarkRunner()
+        running_task = runner.running_task = Mock()
+        executor = runner.executor = Mock()
+
+        with patch.object(runner, "kill_proc_tree") as kill_proc_tree:
+            runner.shutdown(cancel=True)
+
+        running_task.case_runners.__iter__.assert_called_once_with()
+        kill_proc_tree.assert_called_once_with(timeout=5)
+        executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+        assert runner.running_task is None
+
     def test_get_results(self):
         runner = BenchMarkRunner()
 

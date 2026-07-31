@@ -1,7 +1,7 @@
 import logging
+import signal
 import time
 from collections.abc import Callable
-from concurrent.futures import wait
 from datetime import datetime
 from pathlib import Path
 from pprint import pformat
@@ -20,7 +20,7 @@ from yaml import load
 from .. import config
 from ..backend.clients import DB
 from ..backend.clients.api import MetricType
-from ..interface import benchmark_runner, global_result_future
+from ..interface import benchmark_runner
 from ..models import (
     CaseConfig,
     CaseType,
@@ -670,10 +670,15 @@ def run(
 
     log.info(f"Task:\n{pformat(task)}\n")
     if not parameters["dry_run"]:
-        benchmark_runner.run([task], task_label)
-        time.sleep(5)
-        if global_result_future:
-            wait([global_result_future])
+        previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
-        while benchmark_runner.has_running():
-            time.sleep(1)
+        def stop_on_sigterm(signum, frame):  # noqa: ANN001, ARG001
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, stop_on_sigterm)
+        try:
+            benchmark_runner.run([task], task_label)
+            benchmark_runner.wait()
+        finally:
+            benchmark_runner.shutdown(cancel=True)
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
