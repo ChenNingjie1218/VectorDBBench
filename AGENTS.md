@@ -34,12 +34,15 @@ Common target semantics:
 | `load-search-1m-local` | 1M inline SPFRESH load, index creation, serial search, and concurrent search. |
 | `load-search-1m-non-inline-local` | 1M load plus non-inline SPFRESH build. |
 | `load-search-1m-split-local` | 1M load plus split SPFRESH build. |
-| `build` | Build-only path on an existing 1M table; skips load/drop and concurrent search. |
+| `build-1m-local` | Rebuild on an existing 1M table, then run serial and concurrent search. |
+| `build-only-1m-local` | Rebuild on an existing 1M table, then run serial validation only. |
 | `search-1m-local` | Search-only path on an existing 1M table and index. |
 | `load-search-10m-local` | 10M inline SPFRESH load/search in database `test10m`. |
 | `load-search-10m-non-inline-local` | 10M load plus non-inline SPFRESH build. |
 | `load-search-10m-split-local` | 10M load plus split SPFRESH build. |
 | `search-10m-local` | Search-only path on an existing 10M table and index. |
+| `build-10m-local` | Rebuild on an existing 10M table, then run serial and concurrent search. |
+| `build-only-10m-local` | Rebuild on an existing 10M table, then run serial validation only. |
 | `delete-plain-1m-local` | Delete benchmark without building SPFRESH index. |
 | `delete-spfresh-1m-local` | Delete benchmark with SPFRESH index. |
 | `delete-compare-1m-local` | Runs both delete targets and compares results. |
@@ -58,7 +61,7 @@ make load-search-1m-local \
 Example build-only run:
 
 ```sh
-make build \
+make build-only-1m-local \
   ARGS='--spfresh-vector-index-param max_partition_size=256,write_beam_size=8'
 ```
 
@@ -84,5 +87,4 @@ Use these tuned search values when comparing established partition sizes:
 
 `search-*` targets reuse the existing index and cannot change create-time
 parameters. To compare different partition or write-beam settings, recreate or
-rebuild the index with a `load-search-*` target or `build`.
-
+rebuild the index with a `load-search-*` or `build-*-local` target.
