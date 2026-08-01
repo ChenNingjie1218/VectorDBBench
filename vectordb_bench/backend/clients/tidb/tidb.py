@@ -23,6 +23,8 @@ MAX_ALLOWED_PACKET_BYTES = 64 * 1024 * 1024
 @dataclass(frozen=True)
 class SPFreshIndexStatus:
     applied_base_ts: int | None
+    index_state: str
+    is_ready: bool
     lag_seconds: int | None
     owner_lease_expire_ts: int | None
     observed_at: Any
@@ -242,7 +244,7 @@ class TiDB(VectorDB):
     def _fetch_spfresh_index_status(self) -> SPFreshIndexStatus | None:
         self.cursor.execute(
             """
-            SELECT applied_base_ts, lag_seconds, owner_lease_expire_ts, observed_at
+            SELECT applied_base_ts, index_state, is_ready, lag_seconds, owner_lease_expire_ts, observed_at
             FROM information_schema.TIDB_SPFRESH_INDEX_STATUS
             WHERE table_schema = DATABASE() AND table_name = %s AND index_name = %s
             """,
@@ -251,11 +253,37 @@ class TiDB(VectorDB):
         row = self.cursor.fetchone()
         if row is None:
             return None
+        if len(row) != 6:
+            msg = f"Invalid TiDB/SPFresh status response: expected 6 columns, got {len(row)}"
+            raise RuntimeError(msg)
+        required_fields = ("index_state", "is_ready", "observed_at")
+        missing_fields = [name for name, value in zip(required_fields, (row[1], row[2], row[5])) if value is None]
+        if missing_fields:
+            msg = f"Invalid TiDB/SPFresh status response: missing required fields: {', '.join(missing_fields)}"
+            raise RuntimeError(msg)
         return SPFreshIndexStatus(
             applied_base_ts=None if row[0] is None else int(row[0]),
-            lag_seconds=None if row[1] is None else int(row[1]),
-            owner_lease_expire_ts=None if row[2] is None else int(row[2]),
-            observed_at=row[3],
+            index_state=str(row[1]).upper(),
+            is_ready=bool(row[2]),
+            lag_seconds=None if row[3] is None else int(row[3]),
+            owner_lease_expire_ts=None if row[4] is None else int(row[4]),
+            observed_at=row[5],
+        )
+
+    def _spfresh_wait_diagnostic(
+        self,
+        status: SPFreshIndexStatus | None,
+        waited_seconds: float,
+    ) -> str:
+        return (
+            f"table={self.table_name} index={self._spfresh_index_name()} "
+            f"index_state={None if status is None else status.index_state} "
+            f"is_ready={None if status is None else int(status.is_ready)} "
+            f"applied_base_ts={None if status is None else status.applied_base_ts} "
+            f"lag_seconds={None if status is None else status.lag_seconds} "
+            f"owner_lease_expire_ts={None if status is None else status.owner_lease_expire_ts} "
+            f"observed_at={None if status is None else status.observed_at} "
+            f"waited_seconds={waited_seconds:.3f}"
         )
 
     def _wait_for_spfresh_ready(
@@ -264,51 +292,50 @@ class TiDB(VectorDB):
         timeout_seconds: float = SPFRESH_OPTIMIZE_TIMEOUT_SECONDS,
         poll_interval_seconds: float = SPFRESH_POLL_INTERVAL_SECONDS,
     ) -> None:
-        deadline = time.monotonic() + timeout_seconds
-        last_observed = None
+        start = time.monotonic()
+        deadline = start + timeout_seconds
+        last_status = None
+        waited_seconds = 0.0
 
         while time.monotonic() < deadline:
-            status = self._fetch_spfresh_index_status()
-            if status is not None:
-                last_observed = {
-                    "applied_base_ts": status.applied_base_ts,
-                    "lag_seconds": status.lag_seconds,
-                    "owner_lease_expire_ts": status.owner_lease_expire_ts,
-                    "observed_at": status.observed_at,
-                }
+            try:
+                status = self._fetch_spfresh_index_status()
+            except Exception as e:
+                waited_seconds = time.monotonic() - start
+                diagnostic = self._spfresh_wait_diagnostic(last_status, waited_seconds)
+                msg = f"TiDB/SPFresh status query failed: {e}; {diagnostic}"
+                raise RuntimeError(msg) from e
 
             now = time.monotonic()
+            waited_seconds = now - start
             if now >= deadline:
+                last_status = status
                 break
 
-            if status is not None:
-                if status.applied_base_ts is not None and status.applied_base_ts >= barrier_ts:
-                    log.info(
-                        "TiDB/SPFresh status reached barrier_ts=%s applied_base_ts=%s "
-                        "lag_seconds=%s owner_lease_expire_ts=%s observed_at=%s",
-                        barrier_ts,
-                        status.applied_base_ts,
-                        status.lag_seconds,
-                        status.owner_lease_expire_ts,
-                        status.observed_at,
-                    )
-                    return
+            diagnostic = self._spfresh_wait_diagnostic(status, waited_seconds)
+            if status is None:
+                msg = f"TiDB/SPFresh status row is missing while waiting for barrier_ts={barrier_ts}; {diagnostic}"
+                raise RuntimeError(msg)
+            last_status = status
 
-                log.info(
-                    "TiDB/SPFresh status catch-up pending: barrier_ts=%s applied_base_ts=%s "
-                    "lag_seconds=%s owner_lease_expire_ts=%s observed_at=%s",
-                    barrier_ts,
-                    status.applied_base_ts,
-                    status.lag_seconds,
-                    status.owner_lease_expire_ts,
-                    status.observed_at,
+            if status.index_state != "READY" or not status.is_ready:
+                msg = f"TiDB/SPFresh index is not ready while waiting for barrier_ts={barrier_ts}; {diagnostic}"
+                raise RuntimeError(msg)
+            if status.applied_base_ts is None:
+                msg = (
+                    f"TiDB/SPFresh READY status is missing applied_base_ts while waiting for "
+                    f"barrier_ts={barrier_ts}; {diagnostic}"
                 )
+                raise RuntimeError(msg)
+            if status.applied_base_ts >= barrier_ts:
+                log.info("TiDB/SPFresh status reached barrier_ts=%s; %s", barrier_ts, diagnostic)
+                return
+
+            log.info("TiDB/SPFresh status catch-up pending: barrier_ts=%s; %s", barrier_ts, diagnostic)
             time.sleep(min(poll_interval_seconds, deadline - now))
 
-        msg = (
-            f"Timed out waiting for TiDB/SPFresh status catch-up to barrier_ts={barrier_ts}; "
-            f"last_observed={last_observed}"
-        )
+        diagnostic = self._spfresh_wait_diagnostic(last_status, waited_seconds)
+        msg = f"Timed out waiting for TiDB/SPFresh status catch-up to barrier_ts={barrier_ts}; {diagnostic}"
         raise RuntimeError(msg)
 
     def wait_spfresh_post_delete_catchup(

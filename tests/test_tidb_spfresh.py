@@ -448,40 +448,39 @@ class TestTiDBSPFresh:
 
     def test_fetch_spfresh_index_status_reads_system_table(self):
         tidb = make_tidb()
-        tidb.cursor = FakeCursor(fetchone_results=[(123, 3, 999, "2026-04-24 14:00:00")])
+        tidb.cursor = FakeCursor(fetchone_results=[(123, "ready", 1, 3, 999, "2026-04-24 14:00:00")])
 
         status = tidb._fetch_spfresh_index_status()
 
         assert status == SPFreshIndexStatus(
             applied_base_ts=123,
+            index_state="READY",
+            is_ready=True,
             lag_seconds=3,
             owner_lease_expire_ts=999,
             observed_at="2026-04-24 14:00:00",
         )
         sql, params = tidb.cursor.execute_calls[0]
         assert "FROM information_schema.TIDB_SPFRESH_INDEX_STATUS" in sql
-        assert "index_state" not in sql.lower()
-        assert "is_ready" not in sql.lower()
+        assert "index_state" in sql.lower()
+        assert "is_ready" in sql.lower()
         assert params == ("vector_bench_test", "idx_embedding_spfresh_l2")
 
     def test_wait_for_spfresh_ready_succeeds_after_polling(self):
         tidb = make_tidb()
         responses = [
-            None,
-            SPFreshIndexStatus(
-                applied_base_ts=None,
-                lag_seconds=None,
-                owner_lease_expire_ts=None,
-                observed_at="2026-04-24 14:00:01",
-            ),
             SPFreshIndexStatus(
                 applied_base_ts=149,
+                index_state="READY",
+                is_ready=True,
                 lag_seconds=1,
                 owner_lease_expire_ts=999,
                 observed_at="2026-04-24 14:00:02",
             ),
             SPFreshIndexStatus(
                 applied_base_ts=150,
+                index_state="READY",
+                is_ready=True,
                 lag_seconds=0,
                 owner_lease_expire_ts=999,
                 observed_at="2026-04-24 14:00:03",
@@ -498,7 +497,7 @@ class TestTiDBSPFresh:
                 poll_interval_seconds=0.01,
             )
 
-        assert fetch_mock.call_count == 4
+        assert fetch_mock.call_count == 2
 
     def test_wait_for_spfresh_ready_succeeds_when_checkpoint_is_above_barrier(self):
         tidb = make_tidb()
@@ -508,6 +507,8 @@ class TestTiDBSPFresh:
                 "_fetch_spfresh_index_status",
                 return_value=SPFreshIndexStatus(
                     applied_base_ts=151,
+                    index_state="READY",
+                    is_ready=True,
                     lag_seconds=0,
                     owner_lease_expire_ts=999,
                     observed_at="2026-04-24 14:00:04",
@@ -532,6 +533,8 @@ class TestTiDBSPFresh:
                 "_fetch_spfresh_index_status",
                 return_value=SPFreshIndexStatus(
                     applied_base_ts=150,
+                    index_state="READY",
+                    is_ready=True,
                     lag_seconds=0,
                     owner_lease_expire_ts=None,
                     observed_at="2026-04-24 14:00:05",
@@ -548,28 +551,23 @@ class TestTiDBSPFresh:
         fetch_mock.assert_called_once_with()
         sleep_mock.assert_not_called()
 
-    def test_wait_for_spfresh_ready_polls_null_checkpoint_until_barrier_is_reached(self):
+    def test_wait_for_spfresh_ready_fails_immediately_on_unknown_null_checkpoint(self):
         tidb = make_tidb()
         with (
             patch.object(
                 tidb,
                 "_fetch_spfresh_index_status",
-                side_effect=[
-                    SPFreshIndexStatus(
-                        applied_base_ts=None,
-                        lag_seconds=None,
-                        owner_lease_expire_ts=None,
-                        observed_at="2026-04-24 14:00:06",
-                    ),
-                    SPFreshIndexStatus(
-                        applied_base_ts=150,
-                        lag_seconds=0,
-                        owner_lease_expire_ts=999,
-                        observed_at="2026-04-24 14:00:07",
-                    ),
-                ],
+                return_value=SPFreshIndexStatus(
+                    applied_base_ts=None,
+                    index_state="UNKNOWN",
+                    is_ready=False,
+                    lag_seconds=None,
+                    owner_lease_expire_ts=None,
+                    observed_at="2026-04-24 14:00:06",
+                ),
             ) as fetch_mock,
-            patch("vectordb_bench.backend.clients.tidb.tidb.time.sleep"),
+            patch("vectordb_bench.backend.clients.tidb.tidb.time.sleep") as sleep_mock,
+            pytest.raises(RuntimeError) as exc_info,
         ):
             tidb._wait_for_spfresh_ready(
                 barrier_ts=150,
@@ -577,21 +575,56 @@ class TestTiDBSPFresh:
                 poll_interval_seconds=0.01,
             )
 
-        assert fetch_mock.call_count == 2
+        fetch_mock.assert_called_once_with()
+        sleep_mock.assert_not_called()
+        message = str(exc_info.value)
+        assert "table=vector_bench_test" in message
+        assert "index=idx_embedding_spfresh_l2" in message
+        assert "index_state=UNKNOWN" in message
+        assert "is_ready=0" in message
+        assert "applied_base_ts=None" in message
+        assert "lag_seconds=None" in message
+        assert "owner_lease_expire_ts=None" in message
+        assert "observed_at=2026-04-24 14:00:06" in message
+        assert "waited_seconds=" in message
 
-    def test_wait_for_spfresh_ready_times_out_with_last_null_checkpoint_observation(self):
+    def test_wait_for_spfresh_ready_fails_immediately_on_needs_rebuild(self):
+        tidb = make_tidb()
+        status = SPFreshIndexStatus(
+            applied_base_ts=149,
+            index_state="NEEDS_REBUILD",
+            is_ready=False,
+            lag_seconds=1,
+            owner_lease_expire_ts=999,
+            observed_at="2026-04-24 14:00:07",
+        )
+        with (
+            patch.object(tidb, "_fetch_spfresh_index_status", return_value=status) as fetch_mock,
+            patch("vectordb_bench.backend.clients.tidb.tidb.time.sleep") as sleep_mock,
+            pytest.raises(RuntimeError, match="index_state=NEEDS_REBUILD"),
+        ):
+            tidb._wait_for_spfresh_ready(
+                barrier_ts=150,
+                timeout_seconds=1,
+                poll_interval_seconds=0.01,
+            )
+
+        fetch_mock.assert_called_once_with()
+        sleep_mock.assert_not_called()
+
+    def test_wait_for_spfresh_ready_rejects_ready_without_checkpoint(self):
         tidb = make_tidb()
         null_checkpoint = SPFreshIndexStatus(
             applied_base_ts=None,
+            index_state="READY",
+            is_ready=True,
             lag_seconds=None,
             owner_lease_expire_ts=None,
             observed_at="2026-04-24 14:00:08",
         )
-        time_points = iter([0.0, 0.5, 1.1])
         with (
             patch.object(tidb, "_fetch_spfresh_index_status", return_value=null_checkpoint),
-            patch("vectordb_bench.backend.clients.tidb.tidb.time.monotonic", side_effect=lambda: next(time_points)),
-            patch("vectordb_bench.backend.clients.tidb.tidb.time.sleep"),
+            patch("vectordb_bench.backend.clients.tidb.tidb.time.sleep") as sleep_mock,
             pytest.raises(RuntimeError) as exc_info,
         ):
             tidb._wait_for_spfresh_ready(
@@ -600,17 +633,16 @@ class TestTiDBSPFresh:
                 poll_interval_seconds=0.01,
             )
 
-        assert "barrier_ts=150" in str(exc_info.value)
-        assert "'applied_base_ts': None" in str(exc_info.value)
-        assert "'observed_at': '2026-04-24 14:00:08'" in str(exc_info.value)
+        sleep_mock.assert_not_called()
+        assert "READY status is missing applied_base_ts" in str(exc_info.value)
+        assert "applied_base_ts=None" in str(exc_info.value)
+        assert "observed_at=2026-04-24 14:00:08" in str(exc_info.value)
 
-    def test_wait_for_spfresh_ready_times_out_when_status_row_never_appears(self):
+    def test_wait_for_spfresh_ready_fails_when_status_row_is_missing(self):
         tidb = make_tidb()
-        time_points = iter([0.0, 0.5, 1.1])
         with (
-            patch.object(tidb, "_fetch_spfresh_index_status", return_value=None),
-            patch("vectordb_bench.backend.clients.tidb.tidb.time.monotonic", side_effect=lambda: next(time_points)),
-            patch("vectordb_bench.backend.clients.tidb.tidb.time.sleep"),
+            patch.object(tidb, "_fetch_spfresh_index_status", return_value=None) as fetch_mock,
+            patch("vectordb_bench.backend.clients.tidb.tidb.time.sleep") as sleep_mock,
             pytest.raises(RuntimeError) as exc_info,
         ):
             tidb._wait_for_spfresh_ready(
@@ -619,13 +651,17 @@ class TestTiDBSPFresh:
                 poll_interval_seconds=0.01,
             )
 
-        assert "barrier_ts=150" in str(exc_info.value)
-        assert "last_observed=None" in str(exc_info.value)
+        fetch_mock.assert_called_once_with()
+        sleep_mock.assert_not_called()
+        assert "status row is missing" in str(exc_info.value)
+        assert "index_state=None" in str(exc_info.value)
 
     def test_wait_for_spfresh_ready_times_out_with_last_checkpoint_below_barrier(self):
         tidb = make_tidb()
         below_barrier = SPFreshIndexStatus(
             applied_base_ts=149,
+            index_state="READY",
+            is_ready=True,
             lag_seconds=0,
             owner_lease_expire_ts=999,
             observed_at="2026-04-24 14:00:09",
@@ -644,12 +680,17 @@ class TestTiDBSPFresh:
             )
 
         assert "barrier_ts=150" in str(exc_info.value)
-        assert "'applied_base_ts': 149" in str(exc_info.value)
+        assert "index_state=READY" in str(exc_info.value)
+        assert "is_ready=1" in str(exc_info.value)
+        assert "applied_base_ts=149" in str(exc_info.value)
+        assert "waited_seconds=1.100" in str(exc_info.value)
 
     def test_wait_for_spfresh_ready_rejects_checkpoint_observed_at_deadline(self):
         tidb = make_tidb()
         reached_barrier = SPFreshIndexStatus(
             applied_base_ts=150,
+            index_state="READY",
+            is_ready=True,
             lag_seconds=0,
             owner_lease_expire_ts=999,
             observed_at="2026-04-24 14:00:10",
@@ -667,13 +708,24 @@ class TestTiDBSPFresh:
             )
 
         assert "barrier_ts=150" in str(exc_info.value)
-        assert "'applied_base_ts': 150" in str(exc_info.value)
+        assert "applied_base_ts=150" in str(exc_info.value)
 
     def test_wait_for_spfresh_ready_caps_poll_interval_to_remaining_timeout(self):
         tidb = make_tidb()
         time_points = iter([0.0, 0.25, 0.75, 1.0])
         with (
-            patch.object(tidb, "_fetch_spfresh_index_status", return_value=None) as fetch_mock,
+            patch.object(
+                tidb,
+                "_fetch_spfresh_index_status",
+                return_value=SPFreshIndexStatus(
+                    applied_base_ts=149,
+                    index_state="READY",
+                    is_ready=True,
+                    lag_seconds=1,
+                    owner_lease_expire_ts=999,
+                    observed_at="2026-04-24 14:00:11",
+                ),
+            ) as fetch_mock,
             patch("vectordb_bench.backend.clients.tidb.tidb.time.monotonic", side_effect=lambda: next(time_points)),
             patch("vectordb_bench.backend.clients.tidb.tidb.time.sleep") as sleep_mock,
             pytest.raises(RuntimeError, match="barrier_ts=150"),
@@ -687,12 +739,12 @@ class TestTiDBSPFresh:
         fetch_mock.assert_called_once_with()
         sleep_mock.assert_called_once_with(0.25)
 
-    def test_wait_for_spfresh_ready_propagates_status_query_errors(self):
+    def test_wait_for_spfresh_ready_reports_status_query_errors(self):
         tidb = make_tidb()
         query_error = RuntimeError("TiDB status query failed")
         with (
             patch.object(tidb, "_fetch_spfresh_index_status", side_effect=query_error),
-            pytest.raises(RuntimeError, match="TiDB status query failed") as exc_info,
+            pytest.raises(RuntimeError) as exc_info,
         ):
             tidb._wait_for_spfresh_ready(
                 barrier_ts=150,
@@ -700,4 +752,23 @@ class TestTiDBSPFresh:
                 poll_interval_seconds=0.01,
             )
 
-        assert exc_info.value is query_error
+        assert exc_info.value.__cause__ is query_error
+        message = str(exc_info.value)
+        assert "status query failed: TiDB status query failed" in message
+        assert "table=vector_bench_test" in message
+        assert "index=idx_embedding_spfresh_l2" in message
+        assert "waited_seconds=" in message
+
+    def test_fetch_spfresh_index_status_rejects_missing_columns(self):
+        tidb = make_tidb()
+        tidb.cursor = FakeCursor(fetchone_results=[(123, "READY")])
+
+        with pytest.raises(RuntimeError, match="expected 6 columns, got 2"):
+            tidb._fetch_spfresh_index_status()
+
+    def test_fetch_spfresh_index_status_rejects_missing_required_fields(self):
+        tidb = make_tidb()
+        tidb.cursor = FakeCursor(fetchone_results=[(123, None, None, 0, None, None)])
+
+        with pytest.raises(RuntimeError, match="missing required fields: index_state, is_ready, observed_at"):
+            tidb._fetch_spfresh_index_status()
