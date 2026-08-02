@@ -337,7 +337,7 @@ class TestTiDBSPFresh:
         assert "CREATE TABLE vector_bench_test" in sql
         assert "VECTOR INDEX" not in sql
 
-    def test_build_spfresh_index_records_alter_table_duration(self):
+    def test_build_spfresh_index_replaces_only_the_benchmark_index(self):
         tidb = TiDB(
             dim=3,
             db_config={
@@ -361,9 +361,15 @@ class TestTiDBSPFresh:
         with patch("vectordb_bench.backend.clients.tidb.tidb.time.perf_counter", side_effect=[10.0, 13.5]):
             result = tidb.build_spfresh_index()
 
-        sql, _ = tidb.cursor.execute_calls[0]
-        assert "ALTER TABLE vector_bench_test ADD VECTOR INDEX idx_embedding_spfresh_l2" in sql
-        assert "VECTOR_INDEX_PARAM 'min_partition_size=32,max_partition_size=256,write_beam_size=8'" in sql
+        executed_sql = [sql for sql, _ in tidb.cursor.execute_calls]
+        assert executed_sql[0] == (
+            "DROP INDEX IF EXISTS idx_embedding_spfresh_l2 ON vector_bench_test"
+        )
+        assert "ALTER TABLE vector_bench_test ADD VECTOR INDEX idx_embedding_spfresh_l2" in executed_sql[1]
+        assert (
+            "VECTOR_INDEX_PARAM 'min_partition_size=32,max_partition_size=256,write_beam_size=8'"
+            in executed_sql[1]
+        )
         assert result.optimize_duration == 0.0
         assert result.spfresh_build_duration == 3.5
         assert result.spfresh_incremental_catchup_duration == 0.0

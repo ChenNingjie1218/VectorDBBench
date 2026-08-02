@@ -131,6 +131,7 @@ class TiDB(VectorDB):
             self.table_name,
             self._spfresh_index_name(),
         )
+        self._drop_spfresh_index()
         start = time.perf_counter()
         self._create_spfresh_index()
         build_duration = time.perf_counter() - start
@@ -210,6 +211,11 @@ class TiDB(VectorDB):
             return ""
         escaped = param.replace("'", "''")
         return f" VECTOR_INDEX_PARAM '{escaped}'"
+
+    def _drop_spfresh_index(self) -> None:
+        self.cursor.execute(
+            f"DROP INDEX IF EXISTS {self._spfresh_index_name()} ON {self.table_name}",
+        )
 
     def _create_spfresh_index(self) -> None:
         self.cursor.execute(f"ALTER TABLE {self.table_name} ADD {self._spfresh_index_definition()}")
