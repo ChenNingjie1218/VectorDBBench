@@ -49,6 +49,12 @@ build-10m-local:
 build-only-10m-local:
 	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test10m --task-label tidb-spfresh-build-only-10m --case-type Performance768D10M --skip-load --build --skip-search-concurrent --spfresh-build-mode non-inline $(ARGS)
 
+build-100m-local:
+	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test100m --task-label tidb-spfresh-build-100m --case-type Performance768D100M --skip-load --build --spfresh-build-mode non-inline $(ARGS)
+
+build-only-100m-local:
+	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test100m --task-label tidb-spfresh-build-only-100m --case-type Performance768D100M --skip-load --build --skip-search-concurrent --spfresh-build-mode non-inline $(ARGS)
+
 delete-plain-1m-local:
 	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test --task-label tidb-spfresh-delete-plain --case-type Performance768D1M --delete --skip-search-serial --skip-search-concurrent --skip-build-spfresh-index
 

@@ -24,8 +24,8 @@ test -x .venv/bin/vectordbbench
 ```
 
 The `*-local` targets currently connect to TiDB on `127.0.0.1:4000` as `root`
-with an empty password. The 1M targets use database `test`; the 10M targets use
-database `test10m`.
+with an empty password. The 1M targets use database `test`, the 10M targets use
+database `test10m`, and the 100M targets use database `test100m`.
 
 Common target semantics:
 
@@ -43,6 +43,8 @@ Common target semantics:
 | `search-10m-local` | Search-only path on an existing 10M table and index. |
 | `build-10m-local` | Rebuild on an existing 10M table, then run serial and concurrent search. |
 | `build-only-10m-local` | Rebuild on an existing 10M table, then run serial validation only. |
+| `build-100m-local` | Rebuild on an existing 100M table, then run serial and concurrent search. |
+| `build-only-100m-local` | Rebuild on an existing 100M table, then run serial validation only. |
 | `delete-plain-1m-local` | Delete benchmark without building SPFRESH index. |
 | `delete-spfresh-1m-local` | Delete benchmark with SPFRESH index. |
 | `delete-compare-1m-local` | Runs both delete targets and compares results. |
