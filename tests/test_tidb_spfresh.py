@@ -13,6 +13,7 @@ from vectordb_bench.backend.clients.tidb.tidb import (
     SPFreshIndexStatus,
     TiDB,
 )
+from vectordb_bench.backend.filter import IntFilter, LabelFilter
 from vectordb_bench.backend.runner import SerialInsertRunner
 from vectordb_bench.backend.task_runner import CaseRunner
 
@@ -29,6 +30,9 @@ class FakeCursor:
         if not self.fetchone_results:
             return None
         return self.fetchone_results.pop(0)
+
+    def fetchall(self):
+        return [(1,), (2,)]
 
 
 class FakeConnection:
@@ -88,6 +92,32 @@ def make_tidb(dim: int = 3) -> TiDB:
 
 
 class TestTiDBSPFresh:
+    def test_supports_numeric_greater_equal_filters_only(self):
+        numeric_filter = IntFilter(filter_rate=0.01, int_field="id", int_value=100)
+        label_filter = LabelFilter(label_percentage=0.01)
+
+        assert TiDB.filter_supported(numeric_filter)
+        assert not TiDB.filter_supported(label_filter)
+
+    def test_numeric_filter_is_applied_to_search_sql(self):
+        tidb = make_tidb()
+        tidb.cursor = FakeCursor()
+        tidb.prepare_filter(IntFilter(filter_rate=0.01, int_field="id", int_value=100))
+
+        result = tidb.search_embedding(query=[0.1, 0.2, 0.3], k=10)
+
+        assert result == [1, 2]
+        sql, params = tidb.cursor.execute_calls[-1]
+        assert "SELECT id FROM vector_bench_test WHERE id >= %s" in sql
+        assert "ORDER BY vec_l2_distance(embedding" in sql
+        assert params == (100,)
+
+    def test_numeric_filter_rejects_non_id_field(self):
+        tidb = make_tidb()
+
+        with pytest.raises(ValueError, match="only supports numeric filters on id"):
+            tidb.prepare_filter(IntFilter(filter_rate=0.01, int_field="metadata_id", int_value=100))
+
     def test_serial_insert_runner_loads_requested_row_range(self):
         db = FakeInsertDB()
         runner = SerialInsertRunner(

@@ -10,6 +10,7 @@ from typing import Any
 import pymysql
 
 from ....metric import OptimizeResult
+from ...filter import Filter, FilterOp
 from ..api import VectorDB
 from .config import SPFreshBuildMode, TiDBIndexConfig
 
@@ -31,6 +32,8 @@ class SPFreshIndexStatus:
 
 
 class TiDB(VectorDB):
+    supported_filter_types: list[FilterOp] = [FilterOp.NonFilter, FilterOp.NumGE]
+
     def __init__(
         self,
         dim: int,
@@ -49,6 +52,8 @@ class TiDB(VectorDB):
         self.cursor = None  # To be inited by init()
         self._max_insert_commit_ts: int | None = None
         self._max_delete_commit_ts: int | None = None
+        self.where_clause = ""
+        self.where_params: tuple[int, ...] = ()
 
         self.search_fn = db_case_config.search_param()["metric_fn"]
 
@@ -263,7 +268,9 @@ class TiDB(VectorDB):
             msg = f"Invalid TiDB/SPFresh status response: expected 6 columns, got {len(row)}"
             raise RuntimeError(msg)
         required_fields = ("index_state", "is_ready", "observed_at")
-        missing_fields = [name for name, value in zip(required_fields, (row[1], row[2], row[5])) if value is None]
+        missing_fields = [
+            name for name, value in zip(required_fields, (row[1], row[2], row[5]), strict=True) if value is None
+        ]
         if missing_fields:
             msg = f"Invalid TiDB/SPFresh status response: missing required fields: {', '.join(missing_fields)}"
             raise RuntimeError(msg)
@@ -464,6 +471,20 @@ class TiDB(VectorDB):
         self._max_delete_commit_ts = max_commit_ts
         return deleted, None
 
+    def prepare_filter(self, filters: Filter) -> None:
+        if filters.type == FilterOp.NonFilter:
+            self.where_clause = ""
+            self.where_params = ()
+        elif filters.type == FilterOp.NumGE:
+            if getattr(filters, "int_field", "id") != "id":
+                msg = f"TiDB SPFRESH only supports numeric filters on id, got {filters.int_field}"
+                raise ValueError(msg)
+            self.where_clause = "WHERE id >= %s"
+            self.where_params = (int(filters.int_value),)
+        else:
+            msg = f"Not support Filter for TiDB SPFRESH - {filters}"
+            raise ValueError(msg)
+
     def search_embedding(
         self,
         query: list[float],
@@ -473,9 +494,12 @@ class TiDB(VectorDB):
         **kwargs: Any,
     ) -> list[int]:
         sql = f"""
-            SELECT id FROM {self.table_name}
+            SELECT id FROM {self.table_name} {self.where_clause}
             ORDER BY {self.search_fn}(embedding, "{query!s}") LIMIT {k};
             """  # noqa: S608
-        self.cursor.execute(sql)
+        if self.where_params:
+            self.cursor.execute(sql, self.where_params)
+        else:
+            self.cursor.execute(sql)
         result = self.cursor.fetchall()
         return [int(i[0]) for i in result]
