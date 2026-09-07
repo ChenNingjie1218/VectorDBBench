@@ -75,7 +75,7 @@ class FakeDataset:
         )
 
 
-def make_tidb(dim: int = 3) -> TiDB:
+def make_tidb(dim: int = 3, with_scalar_labels: bool = False) -> TiDB:
     return TiDB(
         dim=dim,
         db_config={
@@ -88,16 +88,17 @@ def make_tidb(dim: int = 3) -> TiDB:
             "ssl_verify_identity": False,
         },
         db_case_config=TiDBIndexConfig(metric_type=MetricType.L2),
+        with_scalar_labels=with_scalar_labels,
     )
 
 
 class TestTiDBSPFresh:
-    def test_supports_numeric_greater_equal_filters_only(self):
+    def test_supports_numeric_and_label_filters(self):
         numeric_filter = IntFilter(filter_rate=0.01, int_field="id", int_value=100)
         label_filter = LabelFilter(label_percentage=0.01)
 
         assert TiDB.filter_supported(numeric_filter)
-        assert not TiDB.filter_supported(label_filter)
+        assert TiDB.filter_supported(label_filter)
 
     def test_numeric_filter_is_applied_to_search_sql(self):
         tidb = make_tidb()
@@ -117,6 +118,25 @@ class TestTiDBSPFresh:
 
         with pytest.raises(ValueError, match="only supports numeric filters on id"):
             tidb.prepare_filter(IntFilter(filter_rate=0.01, int_field="metadata_id", int_value=100))
+
+    def test_label_filter_is_applied_to_search_sql(self):
+        tidb = make_tidb(with_scalar_labels=True)
+        tidb.cursor = FakeCursor()
+        tidb.prepare_filter(LabelFilter(label_percentage=0.01))
+
+        result = tidb.search_embedding(query=[0.1, 0.2, 0.3], k=10)
+
+        assert result == [1, 2]
+        sql, params = tidb.cursor.execute_calls[-1]
+        assert "SELECT id FROM vector_bench_test WHERE labels = %s" in sql
+        assert "ORDER BY vec_l2_distance(embedding" in sql
+        assert params == ("label_1p",)
+
+    def test_label_filter_rejects_client_without_scalar_labels(self):
+        tidb = make_tidb()
+
+        with pytest.raises(ValueError, match="require with_scalar_labels=True"):
+            tidb.prepare_filter(LabelFilter(label_percentage=0.01))
 
     def test_serial_insert_runner_loads_requested_row_range(self):
         db = FakeInsertDB()
@@ -262,6 +282,43 @@ class TestTiDBSPFresh:
 
         assert commit_ts == 123456
 
+    def test_insert_embeddings_serial_writes_scalar_labels(self):
+        tidb = make_tidb(with_scalar_labels=True)
+        cursor = FakeCursor(fetchone_results=[("123456",)])
+        conn = FakeConnection()
+
+        class ConnectionContext:
+            def __enter__(self_inner) -> tuple[FakeConnection, FakeCursor]:
+                return conn, cursor
+
+            def __exit__(
+                self_inner,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
+                return False
+
+        with patch.object(tidb, "_get_connection", return_value=ConnectionContext()):
+            commit_ts = tidb._insert_embeddings_serial(
+                embeddings=[[1.0, 2.0, 3.0]],
+                metadata=[7],
+                offset=0,
+                size=1,
+                labels_data=["label_1p"],
+            )
+
+        assert commit_ts == 123456
+        sql, params = cursor.execute_calls[0]
+        assert "INSERT INTO vector_bench_test (id, embedding, labels) VALUES (7, %s, %s)" in sql
+        assert params == ("[1.0, 2.0, 3.0]", "label_1p")
+
+    def test_insert_embeddings_requires_scalar_labels_when_enabled(self):
+        tidb = make_tidb(with_scalar_labels=True)
+
+        with pytest.raises(ValueError, match="labels_data is required"):
+            tidb.insert_embeddings(embeddings=[[1.0, 2.0, 3.0]], metadata=[7])
+
     def test_create_table_inlines_spfresh_vector_index(self):
         tidb = make_tidb()
         cursor = FakeCursor()
@@ -286,6 +343,30 @@ class TestTiDBSPFresh:
         sql, _ = cursor.execute_calls[0]
         assert "CREATE TABLE vector_bench_test" in sql
         assert "VECTOR INDEX idx_embedding_spfresh_l2 ((vec_l2_distance(embedding))) USING SPFRESH" in sql
+
+    def test_create_table_stores_scalar_labels_for_label_cases(self):
+        tidb = make_tidb(with_scalar_labels=True)
+        cursor = FakeCursor()
+        conn = FakeConnection()
+
+        class ConnectionContext:
+            def __enter__(self_inner) -> tuple[FakeConnection, FakeCursor]:
+                return conn, cursor
+
+            def __exit__(
+                self_inner,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
+                return False
+
+        with patch.object(tidb, "_get_connection", return_value=ConnectionContext()):
+            tidb._create_table()
+
+        sql, _ = cursor.execute_calls[0]
+        assert "labels VARCHAR(64) NOT NULL" in sql
+        assert "USING SPFRESH STORING (labels)" in sql
 
     def test_create_table_inlines_spfresh_vector_index_param(self):
         tidb = TiDB(

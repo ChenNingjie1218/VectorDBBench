@@ -32,7 +32,7 @@ class SPFreshIndexStatus:
 
 
 class TiDB(VectorDB):
-    supported_filter_types: list[FilterOp] = [FilterOp.NonFilter, FilterOp.NumGE]
+    supported_filter_types: list[FilterOp] = [FilterOp.NonFilter, FilterOp.NumGE, FilterOp.StrEqual]
 
     def __init__(
         self,
@@ -41,6 +41,7 @@ class TiDB(VectorDB):
         db_case_config: TiDBIndexConfig,
         collection_name: str = "vector_bench_test",
         drop_old: bool = False,
+        with_scalar_labels: bool = False,
         **kwargs,
     ):
         self.name = "TiDB"
@@ -48,12 +49,14 @@ class TiDB(VectorDB):
         self.case_config = db_case_config
         self.table_name = collection_name
         self.dim = dim
+        self.with_scalar_labels = with_scalar_labels
+        self._scalar_label_field = "labels"
         self.conn = None  # To be inited by init()
         self.cursor = None  # To be inited by init()
         self._max_insert_commit_ts: int | None = None
         self._max_delete_commit_ts: int | None = None
         self.where_clause = ""
-        self.where_params: tuple[int, ...] = ()
+        self.where_params: tuple[Any, ...] = ()
 
         self.search_fn = db_case_config.search_param()["metric_fn"]
 
@@ -92,6 +95,9 @@ class TiDB(VectorDB):
         index_sql = ""
         if self._should_inline_spfresh_index():
             index_sql = f",\n                        {self._spfresh_index_definition()}"
+        scalar_label_sql = ""
+        if self.with_scalar_labels:
+            scalar_label_sql = f",\n                        {self._scalar_label_field} VARCHAR(64) NOT NULL"
 
         try:
             with self._get_connection() as (conn, cursor):
@@ -100,6 +106,7 @@ class TiDB(VectorDB):
                     CREATE TABLE {self.table_name} (
                         id BIGINT PRIMARY KEY,
                         embedding VECTOR({self.dim}) NOT NULL
+                        {scalar_label_sql}
                         {index_sql}
                     );
                     """
@@ -205,8 +212,10 @@ class TiDB(VectorDB):
 
     def _spfresh_index_definition(self) -> str:
         metric_fn = self.case_config.index_param()["metric_fn"]
+        storing_clause = f" STORING ({self._scalar_label_field})" if self.with_scalar_labels else ""
         return (
             f"VECTOR INDEX {self._spfresh_index_name()} (({metric_fn}(embedding))) USING SPFRESH"
+            f"{storing_clause}"
             f"{self._spfresh_vector_index_param_clause()}"
         )
 
@@ -394,16 +403,35 @@ class TiDB(VectorDB):
         metadata: list[int],
         offset: int,
         size: int,
+        labels_data: list[str] | None = None,
     ) -> int:
+        if self.with_scalar_labels:
+            if labels_data is None:
+                raise ValueError("labels_data is required when with_scalar_labels=True")
+            if len(labels_data) != len(embeddings):
+                raise ValueError("labels_data length must match embeddings length")
+
         try:
             with self._get_connection() as (conn, cursor):
                 buf = io.StringIO()
-                buf.write(f"INSERT INTO {self.table_name} (id, embedding) VALUES ")  # noqa: S608
-                for i in range(offset, offset + size):
-                    if i > offset:
-                        buf.write(",")
-                    buf.write(f'({metadata[i]}, "{embeddings[i]!s}")')
-                cursor.execute(buf.getvalue())
+                params: list[str] = []
+                if self.with_scalar_labels:
+                    buf.write(
+                        f"INSERT INTO {self.table_name} (id, embedding, {self._scalar_label_field}) VALUES "  # noqa: S608
+                    )
+                    for i in range(offset, offset + size):
+                        if i > offset:
+                            buf.write(",")
+                        buf.write(f"({metadata[i]}, %s, %s)")
+                        params.extend((str(embeddings[i]), labels_data[i]))
+                    cursor.execute(buf.getvalue(), tuple(params))
+                else:
+                    buf.write(f"INSERT INTO {self.table_name} (id, embedding) VALUES ")  # noqa: S608
+                    for i in range(offset, offset + size):
+                        if i > offset:
+                            buf.write(",")
+                        buf.write(f'({metadata[i]}, "{embeddings[i]!s}")')
+                    cursor.execute(buf.getvalue())
                 conn.commit()
                 return self._last_commit_ts(cursor)
         except Exception as e:
@@ -417,8 +445,15 @@ class TiDB(VectorDB):
         self,
         embeddings: list[list[float]],
         metadata: list[int],
+        labels_data: list[str] | None = None,
         **kwargs: Any,
     ) -> tuple[int, Exception]:
+        if self.with_scalar_labels:
+            if labels_data is None:
+                raise ValueError("labels_data is required when with_scalar_labels=True")
+            if len(labels_data) != len(embeddings):
+                raise ValueError("labels_data length must match embeddings length")
+
         workers = 10
         batch_size = max(1, len(embeddings) // workers)
         batch_size = min(batch_size, self._max_insert_rows_per_transaction())
@@ -427,7 +462,17 @@ class TiDB(VectorDB):
             for i in range(0, len(embeddings), batch_size):
                 offset = i
                 size = min(batch_size, len(embeddings) - i)
-                future = executor.submit(self._insert_embeddings_serial, embeddings, metadata, offset, size)
+                if self.with_scalar_labels:
+                    future = executor.submit(
+                        self._insert_embeddings_serial,
+                        embeddings,
+                        metadata,
+                        offset,
+                        size,
+                        labels_data,
+                    )
+                else:
+                    future = executor.submit(self._insert_embeddings_serial, embeddings, metadata, offset, size)
                 futures.append(future)
             done, pending = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_EXCEPTION)
             executor.shutdown(wait=False)
@@ -481,6 +526,14 @@ class TiDB(VectorDB):
                 raise ValueError(msg)
             self.where_clause = "WHERE id >= %s"
             self.where_params = (int(filters.int_value),)
+        elif filters.type == FilterOp.StrEqual:
+            if not self.with_scalar_labels:
+                raise ValueError("TiDB SPFRESH label filters require with_scalar_labels=True")
+            if getattr(filters, "label_field", self._scalar_label_field) != self._scalar_label_field:
+                msg = f"TiDB SPFRESH only supports label filters on {self._scalar_label_field}"
+                raise ValueError(msg)
+            self.where_clause = f"WHERE {self._scalar_label_field} = %s"
+            self.where_params = (filters.label_value,)
         else:
             msg = f"Not support Filter for TiDB SPFRESH - {filters}"
             raise ValueError(msg)
