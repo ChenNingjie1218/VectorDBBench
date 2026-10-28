@@ -1,6 +1,6 @@
 from typing import TypedDict
 
-from pydantic import BaseModel, SecretStr, validator
+from pydantic import BaseModel, SecretStr
 
 from ..api import DBCaseConfig, DBConfig, IndexType, MetricType
 
@@ -31,33 +31,23 @@ class OceanBaseConfig(DBConfig):
             "database": self.database,
         }
 
-    @validator("*")
-    def not_empty_field(cls, v: any, field: any):
-        if field.name in ["password", "host", "db_label"]:
-            return v
-        if isinstance(v, str | SecretStr) and len(v) == 0:
-            raise ValueError("Empty string!")
-        return v
-
 
 class OceanBaseIndexConfig(BaseModel):
     index: IndexType
     metric_type: MetricType | None = None
     lib: str = "vsag"
+    create_index_parallel: int = 16
+    partitions: int = 0
 
     def parse_metric(self) -> str:
-        if self.metric_type == MetricType.L2 or (
-            self.index == IndexType.HNSW_BQ and self.metric_type == MetricType.COSINE
-        ):
+        if self.metric_type == MetricType.L2:
             return "l2"
         if self.metric_type == MetricType.IP:
             return "inner_product"
         return "cosine"
 
     def parse_metric_func_str(self) -> str:
-        if self.metric_type == MetricType.L2 or (
-            self.index == IndexType.HNSW_BQ and self.metric_type == MetricType.COSINE
-        ):
+        if self.metric_type == MetricType.L2:
             return "l2_distance"
         if self.metric_type == MetricType.IP:
             return "negative_inner_product"
@@ -68,6 +58,7 @@ class OceanBaseHNSWConfig(OceanBaseIndexConfig, DBCaseConfig):
     m: int
     efConstruction: int
     ef_search: int | None = None
+    extra_info_max_size: int | None = 32
     index: IndexType
 
     def index_param(self) -> dict:
@@ -83,7 +74,7 @@ class OceanBaseHNSWConfig(OceanBaseIndexConfig, DBCaseConfig):
 
 
 class OceanBaseIVFConfig(OceanBaseIndexConfig, DBCaseConfig):
-    m: int
+    m: int | None = None
     sample_per_nlist: int
     nbits: int | None = None
     nlist: int

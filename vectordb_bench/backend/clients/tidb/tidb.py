@@ -101,16 +101,14 @@ class TiDB(VectorDB):
 
         try:
             with self._get_connection() as (conn, cursor):
-                cursor.execute(
-                    f"""
+                cursor.execute(f"""
                     CREATE TABLE {self.table_name} (
                         id BIGINT PRIMARY KEY,
                         embedding VECTOR({self.dim}) NOT NULL
                         {scalar_label_sql}
                         {index_sql}
                     );
-                    """
-                )
+                    """)
                 conn.commit()
         except Exception as e:
             log.warning("Failed to create table: %s error: %s", self.table_name, e)
@@ -416,9 +414,7 @@ class TiDB(VectorDB):
                 buf = io.StringIO()
                 params: list[str] = []
                 if self.with_scalar_labels:
-                    buf.write(
-                        f"INSERT INTO {self.table_name} (id, embedding, {self._scalar_label_field}) VALUES "  # noqa: S608
-                    )
+                    buf.write(f"INSERT INTO {self.table_name} (id, embedding, {self._scalar_label_field}) VALUES ")
                     for i in range(offset, offset + size):
                         if i > offset:
                             buf.write(",")
@@ -426,7 +422,7 @@ class TiDB(VectorDB):
                         params.extend((str(embeddings[i]), labels_data[i]))
                     cursor.execute(buf.getvalue(), tuple(params))
                 else:
-                    buf.write(f"INSERT INTO {self.table_name} (id, embedding) VALUES ")  # noqa: S608
+                    buf.write(f"INSERT INTO {self.table_name} (id, embedding) VALUES ")
                     for i in range(offset, offset + size):
                         if i > offset:
                             buf.write(",")
@@ -494,7 +490,7 @@ class TiDB(VectorDB):
             raise RuntimeError("TiDB.delete_embeddings() must be called within `with self.init():`")
 
         deleted = 0
-        delete_sql = f"DELETE FROM {self.table_name} WHERE id = %s"  # noqa: S608
+        delete_sql = f"DELETE FROM {self.table_name} WHERE id = %s"
         commit_interval = self.case_config.delete_commit_interval
         max_commit_ts = self._max_delete_commit_ts
 
@@ -549,7 +545,7 @@ class TiDB(VectorDB):
         sql = f"""
             SELECT id FROM {self.table_name} {self.where_clause}
             ORDER BY {self.search_fn}(embedding, "{query!s}") LIMIT {k};
-            """  # noqa: S608
+            """
         if self.where_params:
             self.cursor.execute(sql, self.where_params)
         else:

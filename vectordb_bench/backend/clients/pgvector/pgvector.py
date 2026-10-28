@@ -3,6 +3,7 @@
 import logging
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
+from copy import copy
 from typing import Any
 
 import numpy as np
@@ -18,9 +19,18 @@ from .config import PgVectorConfigDict, PgVectorIndexConfig
 log = logging.getLogger(__name__)
 
 
+def _redact_connect_config(connect_config: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(connect_config)
+    if "password" in redacted:
+        redacted["password"] = "**********"  # noqa: S105
+    return redacted
+
+
 class PgVector(VectorDB):
     """Use psycopg instructions"""
 
+    name = "PgVector"
+    thread_safe: bool = False
     supported_filter_types: list[FilterOp] = [
         FilterOp.NonFilter,
         FilterOp.NumGE,
@@ -41,7 +51,6 @@ class PgVector(VectorDB):
         with_scalar_labels: bool = False,
         **kwargs,
     ):
-        self.name = "PgVector"
         self.case_config = db_case_config
         self.table_name = db_config["table_name"]
         self.connect_config = db_config["connect_config"]
@@ -60,7 +69,8 @@ class PgVector(VectorDB):
         self.cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
         self.conn.commit()
 
-        log.info(f"{self.name} config values: {self.connect_config}\n{self.case_config}")
+        redacted_connect_config = _redact_connect_config(self.connect_config)
+        log.info("%s config values: %s\n%s", self.name, redacted_connect_config, self.case_config)
         if not any(
             (
                 self.case_config.create_index_before_load,
@@ -69,7 +79,7 @@ class PgVector(VectorDB):
         ):
             msg = (
                 f"{self.name} config must create an index using create_index_before_load or create_index_after_load"
-                f"{self.name} config values: {self.connect_config}\n{self.case_config}"
+                f"{self.name} config values: {redacted_connect_config}\n{self.case_config}"
             )
             log.error(msg)
             raise RuntimeError(msg)
@@ -97,6 +107,14 @@ class PgVector(VectorDB):
         assert cursor is not None, "Cursor is not initialized"
 
         return conn, cursor
+
+    def copy_for_thread(self) -> "VectorDB":
+        # psycopg holds an open socket that can't be deep-copied; shallow-copy
+        # and drop the connection so init() reconnects inside the worker thread.
+        db_copy = copy(self)
+        db_copy.conn = None
+        db_copy.cursor = None
+        return db_copy
 
     def _generate_search_query(self) -> sql.Composed:
         index_param = self.case_config.index_param()
@@ -334,6 +352,13 @@ class PgVector(VectorDB):
 
         index_param = self.case_config.index_param()
         self._set_parallel_index_build_param()
+        # pgvector registers access methods in lowercase ("hnsw", "ivfflat") but
+        # IndexType enum values are uppercase; also IVFFlat maps to "ivfflat" (no underscore).
+        index_type_lower = index_param["index_type"].lower()
+        if index_type_lower == "ivf_flat":
+            index_type_lower = "ivfflat"
+        log.info(f"index_type (original={index_param['index_type']}, normalized={index_type_lower})")
+
         options = []
         for option in index_param["index_creation_with_options"]:
             if option["val"] is not None:
@@ -359,8 +384,8 @@ class PgVector(VectorDB):
                     if index_param["quantization_type"] == "bit"
                     else sql.Identifier("embedding")
                 ),
-                index_type=sql.Identifier(index_param["index_type"]),
-                # This assumes that the quantization_type value matches the quantization function name
+                index_type=sql.Identifier(index_type_lower),
+                # quantization_type value matches the quantization function name
                 quantization_type=sql.SQL(index_param["quantization_type"]),
                 dim=self.dim,
                 embedding_metric=sql.Identifier(index_param["metric"]),
@@ -374,7 +399,7 @@ class PgVector(VectorDB):
             ).format(
                 index_name=sql.Identifier(self._index_name),
                 table_name=sql.Identifier(self.table_name),
-                index_type=sql.Identifier(index_param["index_type"]),
+                index_type=sql.Identifier(index_type_lower),
                 embedding_metric=sql.Identifier(index_param["metric"]),
             )
 
@@ -410,12 +435,10 @@ class PgVector(VectorDB):
                 )
             else:
                 self.cursor.execute(
-                    sql.SQL(
-                        """
+                    sql.SQL("""
                         CREATE TABLE IF NOT EXISTS public.{table_name}
                         ({primary_field} BIGINT PRIMARY KEY, embedding {table_quantization_type}({dim}));
-                        """
-                    ).format(
+                        """).format(
                         table_name=sql.Identifier(self.table_name),
                         table_quantization_type=sql.SQL(index_param["table_quantization_type"]),
                         dim=dim,

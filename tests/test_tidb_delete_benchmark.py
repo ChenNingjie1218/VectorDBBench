@@ -470,7 +470,7 @@ def test_case_runner_verify_search_after_delete_marks_deadline_exceeded_when_res
 def test_case_runner_perf_case_raises_when_delete_verification_deadline_expires():
     case_runner = CaseRunner.construct(
         run_id="run",
-        config=SimpleNamespace(stages=[TaskStage.DELETE]),
+        config=SimpleNamespace(db=DB.Test, stages=[TaskStage.DELETE]),
         ca=SimpleNamespace(dataset=None),
         status=None,
         dataset_source=None,
@@ -491,7 +491,7 @@ def test_case_runner_perf_case_runs_build_only_stage():
     optimize_calls = []
     case_runner = CaseRunner.construct(
         run_id="run",
-        config=SimpleNamespace(stages=[TaskStage.BUILD]),
+        config=SimpleNamespace(db=DB.Test, stages=[TaskStage.BUILD]),
         ca=SimpleNamespace(dataset=None),
         status=None,
         dataset_source=None,
@@ -510,6 +510,8 @@ def test_case_runner_tidb_spfresh_build_only_records_build_without_optimize():
         run_id="run",
         config=SimpleNamespace(
             db=DB.TiDB,
+            insert_batch_size=100,
+            load_concurrency=1,
             db_case_config=TiDBIndexConfig(
                 metric_type=MetricType.COSINE,
                 spfresh_build_mode="non-inline",
@@ -539,6 +541,8 @@ def test_case_runner_inline_spfresh_records_post_insert_catchup_wait():
         run_id="run",
         config=SimpleNamespace(
             db=DB.TiDB,
+            insert_batch_size=100,
+            load_concurrency=1,
             db_case_config=TiDBIndexConfig(metric_type=MetricType.COSINE),
             stages=[TaskStage.LOAD],
         ),
@@ -547,7 +551,7 @@ def test_case_runner_inline_spfresh_records_post_insert_catchup_wait():
         dataset_source=None,
         db=None,
     )
-    object.__setattr__(case_runner, "_load_train_data", lambda: (100, 4.0))
+    object.__setattr__(case_runner, "_load_data", lambda: (100, 4.0))
     object.__setattr__(
         case_runner,
         "_optimize",
@@ -569,6 +573,8 @@ def test_case_runner_non_inline_spfresh_records_only_build_duration():
         run_id="run",
         config=SimpleNamespace(
             db=DB.TiDB,
+            insert_batch_size=100,
+            load_concurrency=1,
             db_case_config=TiDBIndexConfig(
                 metric_type=MetricType.COSINE,
                 spfresh_build_mode="non-inline",
@@ -580,7 +586,7 @@ def test_case_runner_non_inline_spfresh_records_only_build_duration():
         dataset_source=None,
         db=None,
     )
-    object.__setattr__(case_runner, "_load_train_data", lambda: (100, 4.0))
+    object.__setattr__(case_runner, "_load_data", lambda: (100, 4.0))
     object.__setattr__(
         case_runner,
         "_optimize",
@@ -602,6 +608,8 @@ def test_case_runner_split_spfresh_records_post_delta_catchup_wait():
         run_id="run",
         config=SimpleNamespace(
             db=DB.TiDB,
+            insert_batch_size=100,
+            load_concurrency=1,
             db_case_config=TiDBIndexConfig(
                 metric_type=MetricType.COSINE,
                 spfresh_build_mode="split",
@@ -621,7 +629,7 @@ def test_case_runner_split_spfresh_records_post_delta_catchup_wait():
             return 80, 4.0
         return 20, 2.0
 
-    object.__setattr__(case_runner, "_load_train_data", fake_load_train_data)
+    object.__setattr__(case_runner, "_load_data", fake_load_train_data)
     object.__setattr__(
         case_runner,
         "_build_spfresh_index",

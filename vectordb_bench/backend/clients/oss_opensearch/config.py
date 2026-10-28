@@ -1,14 +1,19 @@
 import logging
 from enum import Enum
+from typing import ClassVar
 
-from pydantic import BaseModel, SecretStr, root_validator, validator
+from pydantic import BaseModel, SecretStr, field_validator, model_validator
 
 from ..api import DBCaseConfig, DBConfig, MetricType
+from ..elasticsearch_compatible import build_bm25_similarity_settings, build_fts_index_param
 
 log = logging.getLogger(__name__)
 
 
 class OSSOpenSearchConfig(DBConfig, BaseModel):
+    _extra_empty_skip: ClassVar[frozenset[str]] = frozenset({"user", "password", "host"})
+
+    index_name: str = "vdb_bench_index"
     host: str = ""
     port: int = 80
     user: str | None = None
@@ -22,6 +27,7 @@ class OSSOpenSearchConfig(DBConfig, BaseModel):
             else ()
         )
         return {
+            "index_name": self.index_name,
             "hosts": [{"host": self.host, "port": self.port}],
             "http_auth": http_auth,
             "use_ssl": use_ssl,
@@ -31,18 +37,6 @@ class OSSOpenSearchConfig(DBConfig, BaseModel):
             "ssl_show_warn": False,
             "timeout": 600,
         }
-
-    @validator("*")
-    def not_empty_field(cls, v: any, field: any):
-        if (
-            field.name in cls.common_short_configs()
-            or field.name in cls.common_long_configs()
-            or field.name in ["user", "password", "host"]
-        ):
-            return v
-        if isinstance(v, str | SecretStr) and len(v) == 0:
-            raise ValueError("Empty string!")
-        return v
 
 
 class OSSOS_Engine(Enum):
@@ -111,7 +105,8 @@ class OSSOpenSearchIndexConfig(BaseModel, DBCaseConfig):
     compression_level: str = CompressionLevel.LEVEL_32X
     oversample_factor: float = 1.0
 
-    @validator("quantization_type", pre=True, always=True)
+    @field_validator("quantization_type", mode="before")
+    @classmethod
     def validate_quantization_type(cls, value: any):
         """Convert string values to enum"""
         if not value:
@@ -128,19 +123,22 @@ class OSSOpenSearchIndexConfig(BaseModel, DBCaseConfig):
 
         return mapping.get(value, OSSOpenSearchQuantization.NONE)
 
-    @root_validator
-    def validate_engine_name(cls, values: dict):
-        """Map engine_name string from UI to engine enum"""
-        if values.get("engine_name"):
-            engine_name = values["engine_name"].lower()
+    @model_validator(mode="before")
+    @classmethod
+    def validate_engine_name(cls, data: any) -> any:
+        if not isinstance(data, dict):
+            return data
+        # Map engine_name to engine enum
+        if data.get("engine_name"):
+            engine_name = data["engine_name"].lower()
             if engine_name == "faiss":
-                values["engine"] = OSSOS_Engine.faiss
+                data["engine"] = OSSOS_Engine.faiss
             elif engine_name == "lucene":
-                values["engine"] = OSSOS_Engine.lucene
+                data["engine"] = OSSOS_Engine.lucene
             else:
                 log.warning(f"Unknown engine_name: {engine_name}, defaulting to faiss")
-                values["engine"] = OSSOS_Engine.faiss
-        return values
+                data["engine"] = OSSOS_Engine.faiss
+        return data
 
     def __eq__(self, obj: any):
         return (
@@ -252,3 +250,22 @@ class OSSOpenSearchIndexConfig(BaseModel, DBCaseConfig):
 
     def search_param(self) -> dict:
         return {"ef_search": self.efSearch}
+
+
+class OSSOpenSearchFtsConfig(BaseModel, DBCaseConfig):
+    number_of_shards: int = 1
+    number_of_replicas: int = 0
+    refresh_interval: str = "30s"
+    force_merge_enabled: bool = True
+    metric_type: MetricType = MetricType.BM25
+    bm25_k1: float | None = None
+    bm25_b: float | None = None
+
+    def index_param(self) -> dict:
+        return build_fts_index_param(self.bm25_k1, self.bm25_b)
+
+    def search_param(self) -> dict:
+        return {}
+
+    def similarity_settings(self) -> dict:
+        return build_bm25_similarity_settings(self.bm25_k1, self.bm25_b)

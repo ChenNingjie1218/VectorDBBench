@@ -109,7 +109,7 @@ class PgVectorTypedDict(CommonTypedDict):
         click.option(
             "--reranking-metric",
             type=click.Choice(
-                [metric.value for metric in MetricType if metric.value not in ["HAMMING", "JACCARD"]],
+                [metric.value for metric in MetricType if metric.value not in ["HAMMING", "JACCARD", "BM25"]],
             ),
             help="Distance metric for reranking",
             default="COSINE",
@@ -154,6 +154,8 @@ def PgVectorIVFFlat(
             metric_type=None,
             lists=parameters["lists"],
             probes=parameters["probes"],
+            maintenance_work_mem=parameters["maintenance_work_mem"],
+            max_parallel_workers=parameters["max_parallel_workers"],
             quantization_type=parameters["quantization_type"],
             table_quantization_type=parameters["table_quantization_type"],
             reranking=parameters["reranking"],

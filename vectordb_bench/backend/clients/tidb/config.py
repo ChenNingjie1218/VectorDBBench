@@ -1,7 +1,7 @@
-from enum import Enum
-from typing import Any, TypedDict
+from enum import StrEnum
+from typing import ClassVar, TypedDict
 
-from pydantic import BaseModel, SecretStr, validator
+from pydantic import BaseModel, SecretStr, ValidationInfo, field_validator
 
 from ..api import DBCaseConfig, DBConfig, MetricType
 
@@ -17,6 +17,8 @@ class TiDBConfigDict(TypedDict):
 
 
 class TiDBConfig(DBConfig):
+    _extra_empty_skip: ClassVar[frozenset[str]] = frozenset({"password"})
+
     user_name: str = "root"
     password: SecretStr
     host: str = "127.0.0.1"
@@ -36,18 +38,8 @@ class TiDBConfig(DBConfig):
             "ssl_verify_identity": self.ssl,
         }
 
-    @validator("*")
-    def not_empty_field(cls, v: any, field: any):
-        if v is None:
-            return v
-        if field.name in ["password", "db_label"]:
-            return v
-        if isinstance(v, str | SecretStr) and len(v) == 0:
-            raise ValueError("Empty string!")
-        return v
 
-
-class SPFreshBuildMode(str, Enum):
+class SPFreshBuildMode(StrEnum):
     INLINE = "inline"
     NON_INLINE = "non-inline"
     SPLIT = "split"
@@ -64,31 +56,31 @@ class TiDBIndexConfig(BaseModel, DBCaseConfig):
     delete_search_wait_timeout: float = 30.0
     delete_search_poll_interval: float = 1.0
 
-    @validator("delete_commit_interval")
+    @field_validator("delete_commit_interval")
     def validate_delete_commit_interval(cls, v: int):
         if v < 1:
             raise ValueError("delete_commit_interval must be >= 1")
         return v
 
-    @validator("spfresh_split_ratio")
+    @field_validator("spfresh_split_ratio")
     def validate_spfresh_split_ratio(cls, v: float):
         if v <= 0 or v >= 1:
             raise ValueError("spfresh_split_ratio must be > 0 and < 1")
         return v
 
-    @validator("spfresh_vector_index_param")
+    @field_validator("spfresh_vector_index_param")
     def normalize_spfresh_vector_index_param(cls, v: str | None):
         if v is None:
             return None
         v = v.strip()
         return v or None
 
-    @validator("delete_timeout", "delete_search_wait_timeout", "delete_search_poll_interval")
-    def validate_positive_delete_search_window(cls, v: float, field: Any):
-        if v is None and field.name == "delete_timeout":
+    @field_validator("delete_timeout", "delete_search_wait_timeout", "delete_search_poll_interval")
+    def validate_positive_delete_search_window(cls, v: float, info: ValidationInfo):
+        if v is None and info.field_name == "delete_timeout":
             return v
         if v <= 0:
-            msg = f"{field.name} must be > 0"
+            msg = f"{info.field_name} must be > 0"
             raise ValueError(msg)
         return v
 

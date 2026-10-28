@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
+from vectordb_bench.backend.clients import DB
 from vectordb_bench.backend.clients.api import MetricType
 from vectordb_bench.backend.clients.tidb.config import TiDBIndexConfig
 from vectordb_bench.backend.clients.tidb.tidb import (
@@ -66,7 +67,7 @@ class FakeDataset:
         self.data = SimpleNamespace(train_id_field="id", train_vector_field="emb", scalar_labels_file_separated=True)
         self.scalar_labels = None
 
-    def __iter__(self):
+    def iter_batches(self, batch_size):
         return iter(
             [
                 pd.DataFrame({"id": list(range(5)), "emb": [[float(i)] for i in range(5)]}),
@@ -546,7 +547,7 @@ class TestTiDBSPFresh:
 
         case_runner = CaseRunner.construct(
             run_id="run",
-            config=None,
+            config=SimpleNamespace(db=DB.TiDB, insert_batch_size=100),
             ca=SimpleNamespace(
                 dataset=SimpleNamespace(data=SimpleNamespace(metric_type=MetricType.L2)),
                 filters=None,

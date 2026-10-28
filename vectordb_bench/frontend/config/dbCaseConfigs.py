@@ -1,17 +1,35 @@
-from enum import IntEnum, Enum
 import typing
-from pydantic import BaseModel
-from vectordb_bench.backend.cases import CaseLabel, CaseType
+from enum import Enum, IntEnum
+
+from pydantic import BaseModel, Field
+
+from vectordb_bench.backend.cases import CaseLabel, CaseType, PerformanceCase
 from vectordb_bench.backend.clients import DB
 from vectordb_bench.backend.clients.api import IndexType, MetricType, SQType
-from vectordb_bench.backend.dataset import DatasetWithSizeType
+from vectordb_bench.backend.clients.polardb_pg.config import DEFAULT_GRAPH_CACHE_TIMEOUT_SECONDS
+from vectordb_bench.backend.dataset import (
+    LAION_INT_FILTER_SEARCH_WIDTHS,
+    DatasetManager,
+    DatasetWithSizeType,
+    FtsDatasetWithSizeType,
+    get_registered_datasets,
+)
+from vectordb_bench.backend.payload import PayloadProfile
 from vectordb_bench.frontend.components.custom.getCustomConfig import get_custom_configs
-
 from vectordb_bench.models import CaseConfig, CaseConfigParamType
 
 MAX_STREAMLIT_INT = (1 << 53) - 1
 
 DB_LIST = [d for d in DB if d != DB.Test]
+FTS_SUPPORTED_DBS = {DB.Milvus, DB.ZillizCloud, DB.ElasticCloud, DB.OSSOpenSearch, DB.Vespa, DB.TurboPuffer}
+VECTOR_PAYLOAD_SUPPORTED_DBS = {DB.Milvus, DB.ZillizCloud}
+
+
+def get_payload_profile_options(active_dbs: list[DB]) -> list[PayloadProfile]:
+    profiles = [PayloadProfile.IDS_ONLY]
+    if active_dbs and all(db in VECTOR_PAYLOAD_SUPPORTED_DBS for db in active_dbs):
+        profiles.append(PayloadProfile.VECTOR)
+    return profiles
 
 
 class Delimiter(Enum):
@@ -52,8 +70,10 @@ class UICaseItem(BaseModel):
     description: str = ""
     cases: list[CaseConfig] = []
     caseLabel: CaseLabel = CaseLabel.Performance
+    supportedDbs: list[DB] | None = None
     extra_custom_case_config_inputs: list[ConfigInput] = []
     tmp_custom_config: dict = dict()
+    payload_profiles: list[PayloadProfile] = Field(default_factory=lambda: [PayloadProfile.IDS_ONLY])
 
     def __init__(
         self,
@@ -89,25 +109,43 @@ class UICaseItem(BaseModel):
     def __hash__(self) -> int:
         return hash(self.key if self.key else self.label)
 
+    @property
+    def supports_payload_profiles(self) -> bool:
+        return bool(self.cases) and all(isinstance(case.case, PerformanceCase) for case in self.cases)
+
     def get_cases(self) -> list[CaseConfig]:
-        # return self.cases
-        if len(self.extra_custom_case_config_inputs) == 0:
-            return self.cases
-        cases = [
-            CaseConfig(
-                case_id=c.case_id,
-                k=c.k,
-                concurrency_search_config=c.concurrency_search_config,
-                custom_case={**c.custom_case, **self.tmp_custom_config},
-            )
-            for c in self.cases
+        cases = self.cases
+        if self.extra_custom_case_config_inputs:
+            cases = [
+                CaseConfig(
+                    case_id=case.case_id,
+                    k=case.k,
+                    concurrency_search_config=case.concurrency_search_config,
+                    custom_case={**(case.custom_case or {}), **self.tmp_custom_config},
+                )
+                for case in cases
+            ]
+        if not self.supports_payload_profiles:
+            return cases
+        return [
+            CaseConfig.model_validate({**case.model_dump(), "payload_profile": payload_profile})
+            for case in cases
+            for payload_profile in self.payload_profiles
         ]
-        return cases
+
+    def supports_dbs(self, dbs: list[DB]) -> bool:
+        if self.supportedDbs is None:
+            return True
+        return all(db in self.supportedDbs for db in dbs)
 
 
 class UICaseItemCluster(BaseModel):
     label: str = ""
     uiCaseItems: list[UICaseItem] = []
+
+
+def get_selectable_case_items(caseCluster: UICaseItemCluster, activedDbList: list[DB]) -> list[UICaseItem]:
+    return [uiCaseItem for uiCaseItem in caseCluster.uiCaseItems if uiCaseItem.supports_dbs(activedDbList)]
 
 
 def get_custom_case_items() -> list[UICaseItem]:
@@ -119,7 +157,7 @@ def get_custom_case_items() -> list[UICaseItem]:
                 CaseConfig(
                     case_id=CaseType.PerformanceCustomDataset,
                     custom_case={
-                        **custom_config.dict(),
+                        **custom_config.model_dump(),
                         "use_filter": False,
                     },
                 )
@@ -140,7 +178,7 @@ def get_custom_case_items() -> list[UICaseItem]:
                 CaseConfig(
                     case_id=CaseType.PerformanceCustomDataset,
                     custom_case={
-                        **custom_config.dict(),
+                        **custom_config.model_dump(),
                         "use_filter": True,
                         "label_percentage": label_percentage,
                     },
@@ -155,6 +193,64 @@ def get_custom_case_items() -> list[UICaseItem]:
 
 def generate_normal_cases(case_id: CaseType, custom_case: dict | None = None) -> list[CaseConfig]:
     return [CaseConfig(case_id=case_id, custom_case=custom_case)]
+
+
+def generate_fts_case(dataset_with_size_type: FtsDatasetWithSizeType) -> CaseConfig:
+    return CaseConfig(
+        case_id=CaseType.FTSBm25Performance,
+        custom_case={"dataset_with_size_type": dataset_with_size_type.value},
+    )
+
+
+def get_fts_case_items() -> list[UICaseItem]:
+    dataset_with_size_types = list(FtsDatasetWithSizeType)
+    return [
+        UICaseItem(
+            label=f"FTS BM25 Performance - {dataset_with_size_type.value}",
+            description=(
+                f"This case tests native BM25 full-text search performance on {dataset_with_size_type.value}. "
+                "It measures index building time, recall, serial latency, and search QPS."
+            ),
+            cases=[generate_fts_case(dataset_with_size_type)],
+            caseLabel=CaseLabel.FullTextSearchPerformance,
+            supportedDbs=list(FTS_SUPPORTED_DBS),
+        )
+        for dataset_with_size_type in dataset_with_size_types
+    ]
+
+
+def get_vibe_case_items() -> list[UICaseItem]:
+    def item(manager: DatasetManager) -> UICaseItem:
+        data = manager.data
+        return UICaseItem(
+            label=f"{data.name} ({data.distribution.upper()}, {data.metric_type.value}, {data.dim}D)",
+            description=f"VIBE {data.modality} dataset with {data.size:,} corpus vectors.",
+            cases=[
+                CaseConfig(
+                    case_id=CaseType.Performance,
+                    custom_case={"dataset_name": data.name},
+                )
+            ],
+        )
+
+    return [item(manager) for manager in get_registered_datasets(family="VIBE")]
+
+
+def get_vdbbench_multimodal_case_items() -> list[UICaseItem]:
+    def item(manager: DatasetManager) -> UICaseItem:
+        data = manager.data
+        return UICaseItem(
+            label=f"{data.name} ({data.metric_type.value}, {data.dim}D)",
+            description=f"VDBBench multimodal dataset with {data.size:,} corpus vectors.",
+            cases=[
+                CaseConfig(
+                    case_id=CaseType.Performance,
+                    custom_case={"dataset_name": data.name},
+                )
+            ],
+        )
+
+    return [item(manager) for manager in get_registered_datasets(family="VDBBench")]
 
 
 def get_custom_case_cluter() -> UICaseItemCluster:
@@ -174,7 +270,7 @@ def get_custom_streaming_case_items() -> list[UICaseItem]:
                     case_id=CaseType.StreamingCustomDataset,
                     custom_case={
                         "description": custom_config.description,
-                        "dataset_config": custom_config.dataset_config.dict(),
+                        "dataset_config": custom_config.dataset_config.model_dump(),
                     },
                 )
             ],
@@ -205,9 +301,10 @@ custom_streaming_config: list[ConfigInput] = [
     ),
     ConfigInput(
         label=CaseConfigParamType.insert_rate,
+        displayLabel="Streaming Insert Rate",
         inputType=InputType.Number,
-        inputConfig=dict(step=100, min=100, max=4_000, value=200),
-        inputHelp="fixed insertion rate (rows/s), must be divisible by 100",
+        inputConfig=dict(step=100, min=1, max=MAX_STREAMLIT_INT, value=500),
+        inputHelp="Fixed streaming insertion rate (rows/s); must be at least and divisible by Insert Batch Size.",
     ),
     ConfigInput(
         label=CaseConfigParamType.search_stages,
@@ -253,14 +350,33 @@ def generate_label_filter_cases(dataset_with_size_type: DatasetWithSizeType) -> 
     ]
 
 
-def generate_int_filter_cases(dataset_with_size_type: DatasetWithSizeType) -> list[CaseConfig]:
-    filter_rates = dataset_with_size_type.get_manager().data.scalar_int_rates
+def generate_int_filter_cases(
+    dataset_with_size_type: DatasetWithSizeType,
+    filter_rates: typing.Iterable[float] | None = None,
+) -> list[CaseConfig]:
+    if filter_rates is None:
+        filter_rates = dataset_with_size_type.get_manager().data.scalar_int_rates
     return [
         CaseConfig(
             case_id=CaseType.NewIntFilterPerformanceCase,
             custom_case=dict(dataset_with_size_type=dataset_with_size_type, filter_rate=filter_rate),
         )
         for filter_rate in filter_rates
+    ]
+
+
+def generate_laion_large_topk_filter_items() -> list[UICaseItem]:
+    rates_by_max_k: dict[int, list[float]] = {}
+    for filter_rate, widths in LAION_INT_FILTER_SEARCH_WIDTHS.items():
+        rates_by_max_k.setdefault(widths[-1], []).append(filter_rate)
+
+    return [
+        UICaseItem(
+            label=f"Large LAION Int-Filter - K up to {max_k:,}",
+            description="Filter rates: " + ", ".join(f"{rate * 100:g}%" for rate in filter_rates),
+            cases=generate_int_filter_cases(DatasetWithSizeType.LAIONLarge, filter_rates),
+        )
+        for max_k, filter_rates in rates_by_max_k.items()
     ]
 
 
@@ -295,8 +411,17 @@ UI_CASE_CLUSTERS: list[UICaseItemCluster] = [
         ],
     ),
     UICaseItemCluster(
+        label="VIBE Search Performance",
+        uiCaseItems=get_vibe_case_items(),
+    ),
+    UICaseItemCluster(
+        label="VDBBench Multimodal Search Performance",
+        uiCaseItems=get_vdbbench_multimodal_case_items(),
+    ),
+    UICaseItemCluster(
         label="New-Int-Filter Search Performance Test",
-        uiCaseItems=[
+        uiCaseItems=generate_laion_large_topk_filter_items()
+        + [
             UICaseItem(
                 label=f"Int-Filter Search Performance Test - {dataset_with_size_type.value}",
                 description=(
@@ -358,6 +483,10 @@ UI_CASE_CLUSTERS: list[UICaseItemCluster] = [
             )
         ],
     ),
+    UICaseItemCluster(
+        label="Full-Text Search (FTS) Test",
+        uiCaseItems=get_fts_case_items(),
+    ),
 ]
 
 # DIVIDER = "DIVIDER"
@@ -372,20 +501,12 @@ DISPLAY_CASE_ORDER: list[CaseType] = [
     CaseType.Performance1024D10M,
     CaseType.CapacityDim960,
     CaseType.CapacityDim128,
+    CaseType.FTSBm25Performance,
 ]
 CASE_NAME_ORDER = [case.case_cls().name for case in DISPLAY_CASE_ORDER]
 
 # CASE_LIST = [
 #     item for item in CASE_LIST_WITH_DIVIDER if isinstance(item, CaseType)]
-
-
-class InputType(IntEnum):
-    Text = 20001
-    Number = 20002
-    Option = 20003
-    Float = 20004
-    Bool = 20005
-    Select = 20006
 
 
 class CaseConfigInput(BaseModel):
@@ -419,6 +540,22 @@ CaseConfigParamInput_IndexType = CaseConfigInput(
             IndexType.GPU_IVF_PQ.value,
             IndexType.GPU_CAGRA.value,
             IndexType.GPU_BRUTE_FORCE.value,
+        ],
+    },
+)
+
+CaseConfigParamInput_IndexType_OceanBase = CaseConfigInput(
+    label=CaseConfigParamType.IndexType,
+    inputType=InputType.Option,
+    inputHelp="Select OceanBase index type",
+    inputConfig={
+        "options": [
+            IndexType.HNSW.value,
+            IndexType.HNSW_SQ.value,
+            IndexType.HNSW_BQ.value,
+            IndexType.IVFFlat.value,
+            IndexType.IVFSQ8.value,
+            IndexType.IVFPQ.value,
         ],
     },
 )
@@ -501,7 +638,7 @@ CaseConfigParamInput_reranking_metric_PgDiskANN = CaseConfigInput(
     displayLabel="Reranking Metric",
     inputType=InputType.Option,
     inputConfig={
-        "options": [metric.value for metric in MetricType if metric.value not in ["HAMMING", "JACCARD", "DP"]],
+        "options": [metric.value for metric in MetricType if metric.value not in ["HAMMING", "JACCARD", "DP", "BM25"]],
     },
     isDisplayed=lambda config: config.get(CaseConfigParamType.reranking, False),
 )
@@ -685,6 +822,20 @@ CaseConfigParamInput_m = CaseConfigInput(
     isDisplayed=lambda config: config.get(CaseConfigParamType.IndexType, None) == IndexType.HNSW.value,
 )
 
+CaseConfigParamInput_m_OceanBase = CaseConfigInput(
+    label=CaseConfigParamType.m,
+    displayLabel="m",
+    inputHelp="HNSW graph degree (m) for OceanBase HNSW/HNSW_SQ/HNSW_BQ",
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 4,
+        "max": 128,
+        "value": 16,
+    },
+    isDisplayed=lambda config: config.get(CaseConfigParamType.IndexType, None)
+    in [IndexType.HNSW.value, IndexType.HNSW_SQ.value, IndexType.HNSW_BQ.value],
+)
+
 
 CaseConfigParamInput_EFConstruction_Milvus = CaseConfigInput(
     label=CaseConfigParamType.EFConstruction,
@@ -701,6 +852,20 @@ CaseConfigParamInput_EFConstruction_Milvus = CaseConfigInput(
         IndexType.HNSW_PQ.value,
         IndexType.HNSW_PRQ.value,
     ],
+)
+
+CaseConfigParamInput_EFConstruction_OceanBase = CaseConfigInput(
+    label=CaseConfigParamType.EFConstruction,
+    displayLabel="efConstruction",
+    inputHelp="HNSW efConstruction for OceanBase HNSW/HNSW_SQ/HNSW_BQ",
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 8,
+        "max": 65535,
+        "value": 256,
+    },
+    isDisplayed=lambda config: config.get(CaseConfigParamType.IndexType, None)
+    in [IndexType.HNSW.value, IndexType.HNSW_SQ.value, IndexType.HNSW_BQ.value],
 )
 
 CaseConfigParamInput_SQType = CaseConfigInput(
@@ -860,6 +1025,48 @@ CaseConfigParamInput_EFSearch_PgVectoRS = CaseConfigInput(
         "value": 100,
     },
     isDisplayed=lambda config: config.get(CaseConfigParamType.IndexType, None) == IndexType.HNSW.value,
+)
+
+CaseConfigParamInput_ef_search_OceanBase = CaseConfigInput(
+    label=CaseConfigParamType.ef_search,
+    displayLabel="ef_search",
+    inputHelp="HNSW ef_search (session var ob_hnsw_ef_search) for OceanBase",
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 65535,
+        "value": 100,
+    },
+    isDisplayed=lambda config: config.get(CaseConfigParamType.IndexType, None)
+    in [IndexType.HNSW.value, IndexType.HNSW_SQ.value, IndexType.HNSW_BQ.value],
+)
+
+CaseConfigParamInput_sample_per_nlist_OceanBase = CaseConfigInput(
+    label=CaseConfigParamType.sample_per_nlist,
+    displayLabel="sample_per_nlist",
+    inputHelp="OceanBase IVF training sample multiplier (total samples = sample_per_nlist * nlist)",
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 1000000,
+        "value": 256,
+    },
+    isDisplayed=lambda config: config.get(CaseConfigParamType.IndexType, None)
+    in [IndexType.IVFFlat.value, IndexType.IVFSQ8.value, IndexType.IVFPQ.value],
+)
+
+CaseConfigParamInput_ivf_nprobes_OceanBase = CaseConfigInput(
+    label=CaseConfigParamType.ivf_nprobes,
+    displayLabel="ivf_nprobes",
+    inputHelp="OceanBase IVF search probes (session var ob_ivf_nprobes)",
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 65535,
+        "value": 10,
+    },
+    isDisplayed=lambda config: config.get(CaseConfigParamType.IndexType, None)
+    in [IndexType.IVFFlat.value, IndexType.IVFSQ8.value, IndexType.IVFPQ.value],
 )
 
 CaseConfigParamInput_EFConstruction_PgVector = CaseConfigInput(
@@ -1381,10 +1588,100 @@ CaseConfigParamInput_reranking_metric_PgVector = CaseConfigInput(
     label=CaseConfigParamType.rerankingMetric,
     inputType=InputType.Option,
     inputConfig={
-        "options": [metric.value for metric in MetricType if metric.value not in ["HAMMING", "JACCARD"]],
+        "options": [metric.value for metric in MetricType if metric.value not in ["HAMMING", "JACCARD", "BM25"]],
     },
     isDisplayed=lambda config: config.get(CaseConfigParamType.quantizationType, None) == "bit"
     and config.get(CaseConfigParamType.reranking, False),
+)
+
+
+# PolarDB for PostgreSQL HNSW configs
+CaseConfigParamInput_IndexType_PolarDBPG = CaseConfigInput(
+    label=CaseConfigParamType.IndexType,
+    inputHelp="PolarDB for PostgreSQL currently supports the HNSW index in VectorDBBench",
+    inputType=InputType.Option,
+    inputConfig={"options": [IndexType.HNSW.value]},
+)
+
+CaseConfigParamInput_HnswQuantization_PolarDBPG = CaseConfigInput(
+    label=CaseConfigParamType.hnsw_quantization,
+    displayLabel="Internal quantization",
+    inputHelp="PolarDB HNSW internal quantizer; None keeps the standard pgvector code format",
+    inputType=InputType.Option,
+    inputConfig={"options": [None, "pq", "sq4", "sq8", "rabitq"]},
+)
+
+CaseConfigParamInput_PostLoadIndex_PolarDBPG = CaseConfigInput(
+    label=CaseConfigParamType.post_load_index,
+    displayLabel="Create index after load",
+    inputHelp="Disable to build the HNSW index before loading data",
+    inputType=InputType.Bool,
+    inputConfig={"value": True},
+)
+
+CaseConfigParamInput_PQM_PolarDBPG = CaseConfigInput(
+    label=CaseConfigParamType.pq_m,
+    displayLabel="PQ sub-quantizers",
+    inputHelp="Number of sub-quantizers used by PQ",
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 2,
+        "max": 4096,
+        "value": 32,
+    },
+    isDisplayed=lambda config: config.get(CaseConfigParamType.hnsw_quantization, None) == "pq",
+)
+
+CaseConfigParamInput_TrainSamples_PolarDBPG = CaseConfigInput(
+    label=CaseConfigParamType.train_samples,
+    displayLabel="Quantizer train samples",
+    inputHelp="Number of sampled rows used to train the internal quantizer",
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 100,
+        "max": MAX_STREAMLIT_INT,
+        "value": 1000,
+    },
+    isDisplayed=lambda config: config.get(CaseConfigParamType.hnsw_quantization, None) is not None,
+)
+
+CaseConfigParamInput_QuantizationNbits_PolarDBPG = CaseConfigInput(
+    label=CaseConfigParamType.quantization_nbits,
+    displayLabel="RaBitQ bits per dimension",
+    inputHelp="RaBitQ code width",
+    inputType=InputType.Option,
+    inputConfig={"options": [1, 4, 8]},
+    isDisplayed=lambda config: config.get(CaseConfigParamType.hnsw_quantization, None) == "rabitq",
+)
+
+CaseConfigParamInput_GraphCache_PolarDBPG = CaseConfigInput(
+    label=CaseConfigParamType.graph_cache,
+    displayLabel="Enable Graph Cache",
+    inputHelp="Build Graph Cache and wait until it is usable before search",
+    inputType=InputType.Bool,
+    inputConfig={"value": True},
+)
+
+CaseConfigParamInput_GraphCacheTimeout_PolarDBPG = CaseConfigInput(
+    label=CaseConfigParamType.graph_cache_timeout,
+    displayLabel="Graph Cache timeout (seconds)",
+    inputHelp="Maximum time to wait for Graph Cache to become usable",
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": MAX_STREAMLIT_INT,
+        "value": DEFAULT_GRAPH_CACHE_TIMEOUT_SECONDS,
+    },
+    isDisplayed=lambda config: config.get(CaseConfigParamType.graph_cache, True),
+)
+
+CaseConfigParamInput_IterativeScan_PolarDBPG = CaseConfigInput(
+    label=CaseConfigParamType.iterative_scan,
+    displayLabel="Iterative scan",
+    inputHelp="Graph Cache requires iterative scan to remain off",
+    inputType=InputType.Option,
+    inputConfig={"options": ["off", "strict_order", "relaxed_order"]},
+    isDisplayed=lambda config: not config.get(CaseConfigParamType.graph_cache, True),
 )
 
 
@@ -1518,6 +1815,56 @@ CaseConfigParamInput_max_parallel_workers_AlloyDB = CaseConfigInput(
         "min": 0,
         "max": 1024,
         "value": 7,
+    },
+)
+
+CaseConfigParamInput_IndexType_LakebaseVector = CaseConfigInput(
+    label=CaseConfigParamType.IndexType,
+    inputHelp="Select Index Type",
+    inputType=InputType.Option,
+    inputConfig={
+        "options": [
+            IndexType.LAKEBASE_ANN.value,
+        ],
+    },
+)
+
+CaseConfigParamInput_max_parallel_workers_LakebaseVector = CaseConfigInput(
+    label=CaseConfigParamType.max_parallel_workers,
+    displayLabel="Max parallel workers",
+    inputHelp="Recommended value: (cpu cores - 1). This will set the parameters: max_parallel_maintenance_workers,"
+    " max_parallel_workers & table(parallel_workers)",
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 0,
+        "max": 1024,
+        "value": 16,
+    },
+)
+
+CaseConfigParamInput_Probes_LakebaseVector = CaseConfigInput(
+    label=CaseConfigParamType.probes,
+    displayLabel="Probes",
+    inputHelp=(
+        "Optional positive integer or comma-separated positive integers for lakebase_ann.probes "
+        "(for example: 10 or 54,380); leave empty to use the server default"
+    ),
+    inputType=InputType.Text,
+    inputConfig={
+        "value": "",
+    },
+)
+
+CaseConfigParamInput_Epsilon_LakebaseVector = CaseConfigInput(
+    label=CaseConfigParamType.epsilon,
+    displayLabel="Epsilon",
+    inputHelp="Optional lakebase_ann reranking margin; leave empty to use the server default",
+    inputType=InputType.Float,
+    inputConfig={
+        "min": 0.0,
+        "max": 4.0,
+        "step": 0.1,
+        "value": None,
     },
 )
 
@@ -1743,6 +2090,33 @@ CaseConfigParamInput_Milvus_use_partition_key = CaseConfigInput(
     inputConfig={"options": [False, True]},
 )
 
+CaseConfigParamInput_Milvus_force_merge_enabled = CaseConfigInput(
+    label=CaseConfigParamType.force_merge_enabled,
+    displayLabel="Force Merge Enabled",
+    inputHelp=(
+        "Force-merge compaction during optimize. Disable for a sooner ready-to-search "
+        "state at the cost of segments not merged to their fullest potential."
+    ),
+    inputType=InputType.Bool,
+    inputConfig={"value": True},
+)
+
+CaseConfigParamInput_Milvus_force_merge_target_size_mb = CaseConfigInput(
+    label=CaseConfigParamType.force_merge_target_size_mb,
+    displayLabel="Force Merge Target Size (MB)",
+    inputHelp=(
+        "Target merged segment size in MB requested for the force-merge compaction during "
+        "optimize; the effective cap depends on the Milvus server. Leave empty to keep the "
+        "current unbounded single-segment behavior; e.g. 1024 for bounded segments."
+    ),
+    inputType=InputType.Number,
+    inputConfig={
+        "value": None,
+        "min": 1,
+        "max": MAX_STREAMLIT_INT,
+    },
+)
+
 
 CaseConfigParamInput_MongoDBQuantizationType = CaseConfigInput(
     label=CaseConfigParamType.mongodb_quantization_type,
@@ -1760,6 +2134,16 @@ CaseConfigParamInput_MongoDBNumCandidatesRatio = CaseConfigInput(
         "min": 10,
         "max": 20,
         "value": 10,
+    },
+)
+
+CaseConfigParamInput_MongoDBExact = CaseConfigInput(
+    label=CaseConfigParamType.mongodb_exact,
+    inputType=InputType.Bool,
+    displayLabel="Exact (ENN)",
+    inputHelp="Atlas $vectorSearch exact nearest neighbor. Default False keeps ANN.",
+    inputConfig={
+        "value": False,
     },
 )
 
@@ -2033,6 +2417,113 @@ CaseConfigParamInput_CLIP_OSSOpensearch = CaseConfigInput(
     ),
 )
 
+CaseConfigParamInput_IndexType_FTS = CaseConfigInput(
+    label=CaseConfigParamType.IndexType,
+    inputHelp="FTS Index Type (currently only AUTOINDEX supported)",
+    inputType=InputType.Option,
+    inputConfig={
+        "options": [
+            IndexType.FTS.value,
+        ],
+    },
+    isDisplayed=lambda config: False,  # Hidden since FTS only has one index type currently
+)
+
+CaseConfigParamInput_FTS_inverted_index_algo = CaseConfigInput(
+    label=CaseConfigParamType.inverted_index_algo,
+    displayLabel="Inverted Index Algorithm",
+    inputHelp="Algorithm for building and querying sparse inverted index.",
+    inputType=InputType.Option,
+    inputConfig={
+        "value": "DAAT_MAXSCORE",
+        "options": ["DAAT_MAXSCORE", "DAAT_WAND", "TAAT_NAIVE"],
+    },
+)
+
+CaseConfigParamInput_FTS_bm25_k1 = CaseConfigInput(
+    label=CaseConfigParamType.bm25_k1,
+    displayLabel="BM25 k1",
+    inputHelp="BM25 k1 parameter controls term frequency saturation [1.2, 2.0]. Higher values emphasize term frequency.",
+    inputType=InputType.Float,
+    inputConfig={
+        "value": 1.5,
+        "step": 0.1,
+        "min": 1.2,
+        "max": 2.0,
+    },
+)
+
+CaseConfigParamInput_FTS_bm25_b = CaseConfigInput(
+    label=CaseConfigParamType.bm25_b,
+    displayLabel="BM25 b",
+    inputHelp="BM25 b parameter controls document length normalization [0.0, 1.0]. 0.75 is commonly used.",
+    inputType=InputType.Float,
+    inputConfig={
+        "value": 0.75,
+        "step": 0.05,
+        "min": 0.0,
+        "max": 1.0,
+    },
+)
+
+CaseConfigParamInput_FTS_analyzer_tokenizer = CaseConfigInput(
+    label=CaseConfigParamType.analyzer_tokenizer,
+    displayLabel="Analyzer Tokenizer",
+    inputHelp="Text tokenizer type for BM25 analysis.",
+    inputType=InputType.Option,
+    inputConfig={
+        "value": "standard",
+        "options": ["standard", "whitespace", "keyword"],
+    },
+)
+
+CaseConfigParamInput_FTS_analyzer_enable_lowercase = CaseConfigInput(
+    label=CaseConfigParamType.analyzer_enable_lowercase,
+    displayLabel="Enable Lowercase Filter",
+    inputHelp="Convert text to lowercase during analysis.",
+    inputType=InputType.Bool,
+    inputConfig={
+        "value": True,
+    },
+)
+
+CaseConfigParamInput_FTS_analyzer_max_token_length = CaseConfigInput(
+    label=CaseConfigParamType.analyzer_max_token_length,
+    displayLabel="Max Token Length",
+    inputHelp="Maximum length of individual tokens (optional, leave empty to disable).",
+    inputType=InputType.Number,
+    inputConfig={
+        "value": None,
+        "min": 1,
+        "max": 100,
+    },
+)
+
+CaseConfigParamInput_FTS_analyzer_stop_words = CaseConfigInput(
+    label=CaseConfigParamType.analyzer_stop_words,
+    displayLabel="Stop Words",
+    inputHelp="Comma-separated list of stop words to filter out.",
+    inputType=InputType.Text,
+    inputConfig={
+        "value": "",
+        "placeholder": "of,to,the,and,or",
+    },
+)
+
+CaseConfigParamInput_FTS_drop_ratio_search = CaseConfigInput(
+    label=CaseConfigParamType.drop_ratio_search,
+    displayLabel="Drop Ratio (search)",
+    inputHelp="Search-time sparsification ratio. 0.0 keeps best recall; larger is faster.",
+    inputType=InputType.Float,
+    inputConfig={
+        "value": 0.0,
+        "step": 0.1,
+        "min": 0.0,
+        "max": 0.99,
+    },
+)
+
+
 MilvusLoadConfig = [
     CaseConfigParamInput_IndexType,
     CaseConfigParamInput_M,
@@ -2050,6 +2541,8 @@ MilvusLoadConfig = [
     CaseConfigParamInput_RefineType,
     CaseConfigParamInput_NRQ,
     CaseConfigParamInput_Milvus_use_partition_key,
+    CaseConfigParamInput_Milvus_force_merge_enabled,
+    CaseConfigParamInput_Milvus_force_merge_target_size_mb,
 ]
 MilvusPerformanceConfig = [
     CaseConfigParamInput_IndexType,
@@ -2080,7 +2573,36 @@ MilvusPerformanceConfig = [
     CaseConfigParamInput_RefineType,
     CaseConfigParamInput_RefineK,
     CaseConfigParamInput_Milvus_use_partition_key,
+    CaseConfigParamInput_Milvus_force_merge_enabled,
+    CaseConfigParamInput_Milvus_force_merge_target_size_mb,
 ]
+
+
+MilvusFtsConfig = [
+    CaseConfigParamInput_IndexType_FTS,
+    CaseConfigParamInput_FTS_inverted_index_algo,
+    CaseConfigParamInput_FTS_bm25_k1,
+    CaseConfigParamInput_FTS_bm25_b,
+    CaseConfigParamInput_FTS_analyzer_tokenizer,
+    CaseConfigParamInput_FTS_analyzer_enable_lowercase,
+    CaseConfigParamInput_FTS_analyzer_max_token_length,
+    CaseConfigParamInput_FTS_analyzer_stop_words,
+    CaseConfigParamInput_FTS_drop_ratio_search,
+    CaseConfigParamInput_Milvus_force_merge_enabled,
+    CaseConfigParamInput_Milvus_force_merge_target_size_mb,
+]
+
+ZillizCloudFtsConfig = [
+    CaseConfigParamInput_IndexType_FTS,
+    CaseConfigParamInput_ZillizLevel,
+    CaseConfigParamInput_Milvus_force_merge_enabled,
+    CaseConfigParamInput_Milvus_force_merge_target_size_mb,
+]
+
+ElasticCloudFtsConfig = []
+VespaFtsConfig = []
+OSSOpenSearchFtsConfig = []
+TurboPufferFtsConfig = []
 
 WeaviateLoadConfig = [
     CaseConfigParamInput_MaxConnections,
@@ -2158,6 +2680,45 @@ PgVectorPerformanceConfig = [
     CaseConfigParamInput_quantized_fetch_limit_PgVector,
 ]
 
+PolarDBPgLoadingConfig = [
+    CaseConfigParamInput_IndexType_PolarDBPG,
+    CaseConfigParamInput_PostLoadIndex_PolarDBPG,
+    CaseConfigParamInput_m,
+    CaseConfigParamInput_EFConstruction_PgVector,
+    CaseConfigParamInput_QuantizationType_PgVector,
+    CaseConfigParamInput_TableQuantizationType_PgVector,
+    CaseConfigParamInput_HnswQuantization_PolarDBPG,
+    CaseConfigParamInput_PQM_PolarDBPG,
+    CaseConfigParamInput_TrainSamples_PolarDBPG,
+    CaseConfigParamInput_QuantizationNbits_PolarDBPG,
+    CaseConfigParamInput_maintenance_work_mem_PgVector,
+    CaseConfigParamInput_max_parallel_workers_PgVector,
+    CaseConfigParamInput_GraphCache_PolarDBPG,
+    CaseConfigParamInput_GraphCacheTimeout_PolarDBPG,
+]
+
+PolarDBPgPerformanceConfig = [
+    CaseConfigParamInput_IndexType_PolarDBPG,
+    CaseConfigParamInput_PostLoadIndex_PolarDBPG,
+    CaseConfigParamInput_m,
+    CaseConfigParamInput_EFConstruction_PgVector,
+    CaseConfigParamInput_EFSearch_PgVector,
+    CaseConfigParamInput_QuantizationType_PgVector,
+    CaseConfigParamInput_TableQuantizationType_PgVector,
+    CaseConfigParamInput_HnswQuantization_PolarDBPG,
+    CaseConfigParamInput_PQM_PolarDBPG,
+    CaseConfigParamInput_TrainSamples_PolarDBPG,
+    CaseConfigParamInput_QuantizationNbits_PolarDBPG,
+    CaseConfigParamInput_maintenance_work_mem_PgVector,
+    CaseConfigParamInput_max_parallel_workers_PgVector,
+    CaseConfigParamInput_reranking_PgVector,
+    CaseConfigParamInput_reranking_metric_PgVector,
+    CaseConfigParamInput_quantized_fetch_limit_PgVector,
+    CaseConfigParamInput_GraphCache_PolarDBPG,
+    CaseConfigParamInput_GraphCacheTimeout_PolarDBPG,
+    CaseConfigParamInput_IterativeScan_PolarDBPG,
+]
+
 PgVectoRSLoadingConfig = [
     CaseConfigParamInput_IndexType_PgVectoRS,
     CaseConfigParamInput_m,
@@ -2182,6 +2743,8 @@ PgVectoRSPerformanceConfig = [
 
 ZillizCloudPerformanceConfig = [
     CaseConfigParamInput_ZillizLevel,
+    CaseConfigParamInput_Milvus_force_merge_enabled,
+    CaseConfigParamInput_Milvus_force_merge_target_size_mb,
 ]
 
 PgVectorScaleLoadingConfig = [
@@ -2247,6 +2810,18 @@ AlloyDBPerformanceConfig = [
     CaseConfigParamInput_max_parallel_workers_AlloyDB,
 ]
 
+LakebaseVectorLoadingConfig = [
+    CaseConfigParamInput_IndexType_LakebaseVector,
+    CaseConfigParamInput_max_parallel_workers_LakebaseVector,
+]
+
+LakebaseVectorPerformanceConfig = [
+    CaseConfigParamInput_IndexType_LakebaseVector,
+    CaseConfigParamInput_max_parallel_workers_LakebaseVector,
+    CaseConfigParamInput_Probes_LakebaseVector,
+    CaseConfigParamInput_Epsilon_LakebaseVector,
+]
+
 AliyunElasticsearchLoadingConfig = [
     CaseConfigParamInput_IndexType_ES,
     CaseConfigParamInput_NumShards_ES,
@@ -2285,6 +2860,7 @@ MongoDBLoadingConfig = [
 MongoDBPerformanceConfig = [
     CaseConfigParamInput_MongoDBQuantizationType,
     CaseConfigParamInput_MongoDBNumCandidatesRatio,
+    CaseConfigParamInput_MongoDBExact,
 ]
 
 CockroachDBLoadingConfig = [
@@ -2301,6 +2877,19 @@ CockroachDBPerformanceConfig = [
     CaseConfigParamInput_BuildBeamSize_CockroachDB,
     CaseConfigParamInput_VectorSearchBeamSize_CockroachDB,
 ]
+
+OceanBaseLoadConfig = [
+    CaseConfigParamInput_IndexType_OceanBase,
+    CaseConfigParamInput_m_OceanBase,
+    CaseConfigParamInput_EFConstruction_OceanBase,
+    CaseConfigParamInput_ef_search_OceanBase,
+    CaseConfigParamInput_Nlist,
+    CaseConfigParamInput_sample_per_nlist_OceanBase,
+    CaseConfigParamInput_Nbits_PQ,
+    CaseConfigParamInput_M_PQ,
+    CaseConfigParamInput_ivf_nprobes_OceanBase,
+]
+OceanBasePerformanceConfig = OceanBaseLoadConfig
 
 MariaDBLoadingConfig = [
     CaseConfigParamInput_IndexType_MariaDB,
@@ -2443,6 +3032,194 @@ CaseConfigParamInput_ef_construction_LanceDB = CaseConfigInput(
     isDisplayed=lambda config: config.get(CaseConfigParamType.IndexType, None) == IndexType.HNSW.value,
 )
 
+CaseConfigParamInput_IndexType_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.IndexType,
+    inputHelp="Select Index Type",
+    inputType=InputType.Option,
+    inputConfig={
+        "options": [
+            IndexType.HNSW.value,
+            IndexType.IVFPQ.value,
+            IndexType.IVFBQ.value,
+        ],
+    },
+)
+
+CaseConfigParamInput_M_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.M,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 100,
+        "value": 16,
+    },
+    isDisplayed=lambda config: config[CaseConfigParamType.IndexType] == IndexType.HNSW.value,
+    inputHelp="Hnsw M",
+)
+
+CaseConfigParamInput_EFConstruction_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.EFConstruction,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 1000,
+        "value": 100,
+    },
+    isDisplayed=lambda config: config[CaseConfigParamType.IndexType] == IndexType.HNSW.value,
+    inputHelp="Ef construction",
+)
+
+CaseConfigParamInput_Nlist_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.Nlist,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 2,
+        "max": 1000000,
+        "value": 10000,
+    },
+    isDisplayed=lambda config: config[CaseConfigParamType.IndexType] == IndexType.IVFPQ.value
+    or config[CaseConfigParamType.IndexType] == IndexType.IVFBQ.value,
+    inputHelp="N list",
+)
+
+CaseConfigParamInput_Centroids_Hnsw_M_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.centroids_hnsw_M,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 100,
+        "value": 32,
+    },
+    isDisplayed=lambda config: config[CaseConfigParamType.IndexType] == IndexType.IVFPQ.value
+    or config[CaseConfigParamType.IndexType] == IndexType.IVFBQ.value,
+    inputHelp="Centroids Hnsw M",
+)
+
+CaseConfigParamInput_Centroids_Hnsw_Ef_Construct = CaseConfigInput(
+    label=CaseConfigParamType.centroids_hnsw_efConstruction,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 1000,
+        "value": 500,
+    },
+    isDisplayed=lambda config: config[CaseConfigParamType.IndexType] == IndexType.IVFPQ.value
+    or config[CaseConfigParamType.IndexType] == IndexType.IVFBQ.value,
+    inputHelp="Centroids Hnsw Ef Construct",
+)
+
+
+CaseConfigParamInput_Centroids_Hnsw_Ef_Search = CaseConfigInput(
+    label=CaseConfigParamType.centroids_hnsw_efSearch,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 1000,
+        "value": 200,
+    },
+    isDisplayed=lambda config: config[CaseConfigParamType.IndexType] == IndexType.IVFPQ.value
+    or config[CaseConfigParamType.IndexType] == IndexType.IVFBQ.value,
+    inputHelp="Centroids Hnsw Ef Search",
+)
+
+CaseConfigParamInput_Exbits_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.exbits,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 0,
+        "max": 8,
+        "value": 0,
+    },
+    isDisplayed=lambda config: config[CaseConfigParamType.IndexType] == IndexType.IVFBQ.value,
+    inputHelp="Exbits",
+)
+
+
+class FilterType(Enum):
+    POST_FILTER = "post_filter"
+    PRE_FILTER = "pre_filter"
+    EFFICIENT_FILTER = "efficient_filter"
+
+
+CaseConfigParamInput_FilterType_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.filter_type,
+    inputType=InputType.Option,
+    inputConfig={
+        "options": [FilterType.EFFICIENT_FILTER.value, FilterType.POST_FILTER.value, FilterType.PRE_FILTER.value],
+    },
+    inputHelp="Filter type",
+)
+
+CaseConfigParamInput_EFSearch_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.efSearch,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 1000,
+        "value": 100,
+    },
+    isDisplayed=lambda config: config[CaseConfigParamType.IndexType] == IndexType.HNSW.value,
+    inputHelp="Ef search",
+)
+
+CaseConfigParamInput_Nprobe_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.Nprobe,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 1000,
+        "value": 100,
+    },
+    isDisplayed=lambda config: config[CaseConfigParamType.IndexType] == IndexType.IVFPQ.value
+    or config[CaseConfigParamType.IndexType] == IndexType.IVFBQ.value,
+    inputHelp="N probe",
+)
+
+CaseConfigParamInput_ReorderFactor_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.reorder_factor,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 200,
+        "value": 2,
+    },
+    isDisplayed=lambda config: config[CaseConfigParamType.IndexType] == IndexType.HNSW.value
+    or config[CaseConfigParamType.IndexType] == IndexType.IVFPQ.value
+    or config[CaseConfigParamType.IndexType] == IndexType.IVFBQ.value,
+    inputHelp="Reorder factor",
+)
+
+CaseConfigParamInput_ClientRefactor_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.client_refactor,
+    inputType=InputType.Bool,
+    inputConfig={"value": False},
+    isDisplayed=lambda config: config[CaseConfigParamType.IndexType] == IndexType.IVFPQ.value
+    or config[CaseConfigParamType.IndexType] == IndexType.IVFBQ.value,
+    inputHelp="Whether to use client refactor",
+)
+
+CaseConfigParamInput_KExpandScope_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.k_expand_scope,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 10000,
+        "value": 1000,
+    },
+    inputHelp="K expand scope",
+)
+
+CaseConfigParamInput_NumberOfRegions_Lindorm = CaseConfigInput(
+    label=CaseConfigParamType.number_of_regions,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 100,
+        "value": 1,
+    },
+    inputHelp="Vector number of regions",
+)
+
 LanceDBLoadConfig = [
     CaseConfigParamInput_IndexType_LanceDB,
     CaseConfigParamInput_num_partitions_LanceDB,
@@ -2534,15 +3311,283 @@ OSSOpenSearchPerformanceConfig = [
     CaseConfigParamInput_MEMORY_OPTIMIZED_SEARCH_AWSOpensearch,
 ]
 
+LindormLoadConfig = [
+    CaseConfigParamInput_IndexType_Lindorm,
+    CaseConfigParamInput_M_Lindorm,
+    CaseConfigParamInput_EFConstruction_Lindorm,
+    CaseConfigParamInput_Nlist_Lindorm,
+    CaseConfigParamInput_Exbits_Lindorm,
+    CaseConfigParamInput_NumberOfRegions_Lindorm,
+]
+
+LindormPerformanceConfig = [
+    CaseConfigParamInput_IndexType_Lindorm,
+    CaseConfigParamInput_M_Lindorm,
+    CaseConfigParamInput_EFConstruction_Lindorm,
+    CaseConfigParamInput_Nlist_Lindorm,
+    CaseConfigParamInput_Exbits_Lindorm,
+    CaseConfigParamInput_EFSearch_Lindorm,
+    CaseConfigParamInput_FilterType_Lindorm,
+    CaseConfigParamInput_Nprobe_Lindorm,
+    CaseConfigParamInput_ReorderFactor_Lindorm,
+    CaseConfigParamInput_ClientRefactor_Lindorm,
+    CaseConfigParamInput_KExpandScope_Lindorm,
+    CaseConfigParamInput_Centroids_Hnsw_M_Lindorm,
+    CaseConfigParamInput_Centroids_Hnsw_Ef_Construct,
+    CaseConfigParamInput_Centroids_Hnsw_Ef_Search,
+    CaseConfigParamInput_NumberOfRegions_Lindorm,
+]
+
+# PolarDB configs
+CaseConfigParamInput_IndexType_PolarDB = CaseConfigInput(
+    label=CaseConfigParamType.IndexType,
+    inputHelp="Select Index Type",
+    inputType=InputType.Option,
+    inputConfig={
+        "options": [
+            IndexType.HNSW.value,
+            IndexType.HNSW_PQ.value,
+            IndexType.HNSW_SQ.value,
+        ],
+    },
+)
+
+CaseConfigParamInput_M_PolarDB = CaseConfigInput(
+    label=CaseConfigParamType.M,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 2,
+        "max": 1024,
+        "value": 16,
+    },
+    inputHelp="HNSW M parameter",
+)
+
+CaseConfigParamInput_EFConstruction_PolarDB = CaseConfigInput(
+    label=CaseConfigParamType.ef_construction,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 8192,
+        "value": 200,
+    },
+    inputHelp="ef_construction",
+)
+
+CaseConfigParamInput_EFSearch_PolarDB = CaseConfigInput(
+    label=CaseConfigParamType.ef_search,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 8192,
+        "value": 200,
+    },
+    inputHelp="ef_search",
+)
+
+CaseConfigParamInput_InsertWorkers_PolarDB = CaseConfigInput(
+    label=CaseConfigParamType.insert_workers,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 1024,
+        "value": 10,
+    },
+    inputHelp="Number of insert workers",
+)
+
+CaseConfigParamInput_PostLoadIndex_PolarDB = CaseConfigInput(
+    label=CaseConfigParamType.post_load_index,
+    inputType=InputType.Bool,
+    inputConfig={
+        "value": True,
+    },
+    inputHelp="Create index after data load via ALTER TABLE",
+)
+
+CaseConfigParamInput_PQM_PolarDB = CaseConfigInput(
+    label=CaseConfigParamType.pq_m,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 16383,
+        "value": 1,
+    },
+    isDisplayed=lambda config: config.get(CaseConfigParamType.IndexType, None) == IndexType.HNSW_PQ.value,
+    inputHelp="PQ M parameter",
+)
+
+CaseConfigParamInput_PQNbits_PolarDB = CaseConfigInput(
+    label=CaseConfigParamType.pq_nbits,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 24,
+        "value": 8,
+    },
+    isDisplayed=lambda config: config.get(CaseConfigParamType.IndexType, None) == IndexType.HNSW_PQ.value,
+    inputHelp="PQ nbits parameter",
+)
+
+CaseConfigParamInput_SQType_PolarDB = CaseConfigInput(
+    label=CaseConfigParamType.sq_type,
+    inputType=InputType.Option,
+    inputConfig={
+        "options": [
+            "8bit",
+            "4bit",
+            "8bit_uniform",
+            "4bit_uniform",
+            "8bit_direct",
+            "8bit_direct_signed",
+            "fp16",
+            "bf16",
+            "6bit",
+        ],
+    },
+    isDisplayed=lambda config: config.get(CaseConfigParamType.IndexType, None) == IndexType.HNSW_SQ.value,
+    inputHelp="Scalar quantizer type",
+)
+
+PolarDBConfig = [
+    CaseConfigParamInput_IndexType_PolarDB,
+    CaseConfigParamInput_M_PolarDB,
+    CaseConfigParamInput_EFConstruction_PolarDB,
+    CaseConfigParamInput_EFSearch_PolarDB,
+    CaseConfigParamInput_InsertWorkers_PolarDB,
+    CaseConfigParamInput_PostLoadIndex_PolarDB,
+    CaseConfigParamInput_PQM_PolarDB,
+    CaseConfigParamInput_PQNbits_PolarDB,
+    CaseConfigParamInput_SQType_PolarDB,
+]
+
+# ADBPG (Aliyun AnalyticDB for PostgreSQL) configs
+CaseConfigParamInput_Algorithm_Adbpg = CaseConfigInput(
+    label=CaseConfigParamType.algorithm,
+    inputHelp="Select Nova algorithm variant",
+    inputType=InputType.Option,
+    inputConfig={
+        "options": ["novamr", "novad"],
+    },
+)
+
+CaseConfigParamInput_HnswM_Adbpg = CaseConfigInput(
+    label=CaseConfigParamType.hnsw_m,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 256,
+        "value": 16,
+    },
+    inputHelp="HNSW M parameter",
+)
+
+CaseConfigParamInput_EFConstruction_Adbpg = CaseConfigInput(
+    label=CaseConfigParamType.ef_construction,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 2000,
+        "value": 200,
+    },
+    inputHelp="HNSW ef_construction",
+)
+
+CaseConfigParamInput_RabitqBits_Adbpg = CaseConfigInput(
+    label=CaseConfigParamType.rabitq_bits,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 8,
+        "value": 7,
+    },
+    inputHelp="RaBitQ quantization bits",
+)
+
+CaseConfigParamInput_AutoReduction_Adbpg = CaseConfigInput(
+    label=CaseConfigParamType.auto_reduction,
+    inputType=InputType.Bool,
+    inputConfig={"value": False},
+    inputHelp="Enable auto_reduction=on for index build",
+)
+
+CaseConfigParamInput_EFSearch_Adbpg = CaseConfigInput(
+    label=CaseConfigParamType.ef_search,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 2000,
+        "value": 100,
+    },
+    inputHelp="fastann.hnsw_ef_search",
+)
+
+CaseConfigParamInput_MaxScanPoints_Adbpg = CaseConfigInput(
+    label=CaseConfigParamType.max_scan_points,
+    inputType=InputType.Number,
+    inputConfig={
+        "min": 1,
+        "max": 100000,
+        "value": 2000,
+    },
+    inputHelp="fastann.hnsw_max_scan_points",
+)
+
+CaseConfigParamInput_QuantizeRescoreAmp_Adbpg = CaseConfigInput(
+    label=CaseConfigParamType.quantize_rescore_amp,
+    inputType=InputType.Float,
+    inputConfig={
+        "min": 0.0,
+        "max": 100.0,
+        "value": 1.0,
+        "step": 0.1,
+    },
+    inputHelp="fastann.quantize_rescore_amp",
+)
+
+CaseConfigParamInput_NovaAdaptiveGamma_Adbpg = CaseConfigInput(
+    label=CaseConfigParamType.nova_adaptive_gamma,
+    inputType=InputType.Float,
+    inputConfig={
+        "min": 0.0,
+        "max": 1.0,
+        "value": 0.0,
+        "step": 0.05,
+    },
+    inputHelp="fastann.nova_adaptive_gamma",
+)
+
+AdbpgLoadConfig = [
+    CaseConfigParamInput_Algorithm_Adbpg,
+    CaseConfigParamInput_HnswM_Adbpg,
+    CaseConfigParamInput_EFConstruction_Adbpg,
+    CaseConfigParamInput_RabitqBits_Adbpg,
+    CaseConfigParamInput_AutoReduction_Adbpg,
+]
+
+AdbpgPerformanceConfig = [
+    CaseConfigParamInput_Algorithm_Adbpg,
+    CaseConfigParamInput_HnswM_Adbpg,
+    CaseConfigParamInput_EFConstruction_Adbpg,
+    CaseConfigParamInput_RabitqBits_Adbpg,
+    CaseConfigParamInput_AutoReduction_Adbpg,
+    CaseConfigParamInput_EFSearch_Adbpg,
+    CaseConfigParamInput_MaxScanPoints_Adbpg,
+    CaseConfigParamInput_QuantizeRescoreAmp_Adbpg,
+    CaseConfigParamInput_NovaAdaptiveGamma_Adbpg,
+]
+
 # Map DB to config
 CASE_CONFIG_MAP = {
     DB.Milvus: {
         CaseLabel.Load: MilvusLoadConfig,
         CaseLabel.Performance: MilvusPerformanceConfig,
         CaseLabel.Streaming: MilvusPerformanceConfig,
+        CaseLabel.FullTextSearchPerformance: MilvusFtsConfig,
     },
     DB.ZillizCloud: {
         CaseLabel.Performance: ZillizCloudPerformanceConfig,
+        CaseLabel.FullTextSearchPerformance: ZillizCloudFtsConfig,
     },
     DB.WeaviateCloud: {
         CaseLabel.Load: WeaviateLoadConfig,
@@ -2551,6 +3596,7 @@ CASE_CONFIG_MAP = {
     DB.ElasticCloud: {
         CaseLabel.Load: ESLoadingConfig,
         CaseLabel.Performance: ESPerformanceConfig,
+        CaseLabel.FullTextSearchPerformance: ElasticCloudFtsConfig,
     },
     DB.AWSOpenSearch: {
         CaseLabel.Load: AWSOpensearchLoadingConfig,
@@ -2559,10 +3605,15 @@ CASE_CONFIG_MAP = {
     DB.OSSOpenSearch: {
         CaseLabel.Load: OSSOpensearchLoadingConfig,
         CaseLabel.Performance: OSSOpenSearchPerformanceConfig,
+        CaseLabel.FullTextSearchPerformance: OSSOpenSearchFtsConfig,
     },
     DB.PgVector: {
         CaseLabel.Load: PgVectorLoadingConfig,
         CaseLabel.Performance: PgVectorPerformanceConfig,
+    },
+    DB.PolarDBPG: {
+        CaseLabel.Load: PolarDBPgLoadingConfig,
+        CaseLabel.Performance: PolarDBPgPerformanceConfig,
     },
     DB.PgVectoRS: {
         CaseLabel.Load: PgVectoRSLoadingConfig,
@@ -2579,6 +3630,10 @@ CASE_CONFIG_MAP = {
     DB.AlloyDB: {
         CaseLabel.Load: AlloyDBLoadConfig,
         CaseLabel.Performance: AlloyDBPerformanceConfig,
+    },
+    DB.LakebaseVector: {
+        CaseLabel.Load: LakebaseVectorLoadingConfig,
+        CaseLabel.Performance: LakebaseVectorPerformanceConfig,
     },
     DB.AliyunElasticsearch: {
         CaseLabel.Load: AliyunElasticsearchLoadingConfig,
@@ -2599,6 +3654,7 @@ CASE_CONFIG_MAP = {
     DB.Vespa: {
         CaseLabel.Load: VespaLoadingConfig,
         CaseLabel.Performance: VespaPerformanceConfig,
+        CaseLabel.FullTextSearchPerformance: VespaFtsConfig,
     },
     DB.LanceDB: {
         CaseLabel.Load: LanceDBLoadConfig,
@@ -2616,14 +3672,34 @@ CASE_CONFIG_MAP = {
         CaseLabel.Load: CockroachDBLoadingConfig,
         CaseLabel.Performance: CockroachDBPerformanceConfig,
     },
+    DB.OceanBase: {
+        CaseLabel.Load: OceanBaseLoadConfig,
+        CaseLabel.Performance: OceanBasePerformanceConfig,
+    },
+    DB.Lindorm: {
+        CaseLabel.Load: LindormLoadConfig,
+        CaseLabel.Performance: LindormPerformanceConfig,
+    },
+    DB.PolarDB: {
+        CaseLabel.Load: PolarDBConfig,
+        CaseLabel.Performance: PolarDBConfig,
+    },
+    DB.TurboPuffer: {
+        CaseLabel.FullTextSearchPerformance: TurboPufferFtsConfig,
+    },
+    DB.Adbpg: {
+        CaseLabel.Load: AdbpgLoadConfig,
+        CaseLabel.Performance: AdbpgPerformanceConfig,
+    },
 }
 
 
 def get_case_config_inputs(db: DB, case_label: CaseLabel) -> list[CaseConfigInput]:
-    if db not in CASE_CONFIG_MAP:
-        return []
+    db_case_config_map = CASE_CONFIG_MAP.get(db, {})
     if case_label == CaseLabel.Load:
-        return CASE_CONFIG_MAP[db][CaseLabel.Load]
-    elif case_label == CaseLabel.Performance or case_label == CaseLabel.Streaming:
-        return CASE_CONFIG_MAP[db][CaseLabel.Performance]
+        return db_case_config_map.get(CaseLabel.Load, [])
+    if case_label == CaseLabel.Performance or case_label == CaseLabel.Streaming:
+        return db_case_config_map.get(CaseLabel.Performance, [])
+    elif case_label == CaseLabel.FullTextSearchPerformance:
+        return db_case_config_map.get(CaseLabel.FullTextSearchPerformance, [])
     return []

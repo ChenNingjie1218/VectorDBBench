@@ -1,5 +1,49 @@
+import contextlib
+import logging
+import signal
+import threading
 import time
+from collections.abc import Callable
+from contextlib import contextmanager
 from functools import wraps
+
+import psutil
+
+log = logging.getLogger(__name__)
+
+
+def kill_proc_tree(pids: list[int] | None = None, grace: float = 2, timeout: float = 3):
+    """Kill child processes with SIGTERM, then SIGKILL for survivors.
+
+    Args:
+        pids: Specific PIDs to kill. If None, kills all children of the
+              current process (recursive).
+        grace: Seconds to wait after SIGTERM before sending SIGKILL.
+        timeout: Seconds to wait for processes to fully exit after SIGKILL.
+    """
+    if pids is not None:
+        targets = []
+        for pid in pids:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                targets.append(psutil.Process(pid))
+    else:
+        targets = psutil.Process().children(recursive=True)
+
+    for p in targets:
+        try:
+            log.warning(f"sending SIGTERM to child process: {p}")
+            p.send_signal(signal.SIGTERM)
+        except psutil.NoSuchProcess:
+            pass
+
+    _, alive = psutil.wait_procs(targets, timeout=grace)
+    for p in alive:
+        try:
+            log.warning(f"force killing child process: {p}")
+            p.kill()
+        except psutil.NoSuchProcess:
+            pass
+    psutil.wait_procs(alive, timeout=timeout)
 
 
 def numerize(n: int) -> str:
@@ -45,6 +89,29 @@ def time_it(func: any):
         return result, delta
 
     return inner
+
+
+@contextmanager
+def timeout(timeout_seconds: float | None, exc_factory: Callable[[], Exception]):
+    if (
+        timeout_seconds is None
+        or not hasattr(signal, "SIGALRM")
+        or threading.current_thread() is not threading.main_thread()
+    ):
+        yield
+        return
+
+    def _handle_timeout(signum, frame):  # noqa: ANN001, ARG001
+        raise exc_factory()
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handle_timeout)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, float(timeout_seconds))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def compose_train_files(train_count: int, use_shuffled: bool) -> list[str]:
