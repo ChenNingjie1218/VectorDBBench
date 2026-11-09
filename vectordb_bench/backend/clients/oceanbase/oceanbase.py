@@ -73,6 +73,8 @@ class OceanBase(VectorDB):
                 port=self.db_config["port"],
                 password=self.db_config["password"],
                 database=self.db_config["database"],
+                # The C extension can reject OceanBase's charset handshake.
+                use_pure=True,
             )
             self._cursor = self._conn.cursor()
         except mysql.Error:

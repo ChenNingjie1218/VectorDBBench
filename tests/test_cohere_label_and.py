@@ -1,4 +1,4 @@
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -72,3 +72,12 @@ def test_oceanbase_creates_inserts_and_filters_the_native_label_column():
     assert (client.expr, client.where_params) == ("WHERE labels = %s", ("label_1p",))
     client.prepare_filter(non_filter)
     assert (client.expr, client.where_params) == ("", ())
+
+
+def test_oceanbase_uses_the_pure_mysql_connector():
+    client = OceanBase.__new__(OceanBase)
+    client.db_config = {"host": "localhost", "port": 2881, "user": "root", "password": "", "database": "bench"}
+    with patch("vectordb_bench.backend.clients.oceanbase.oceanbase.mysql.connect") as connect:
+        client._connect()
+
+    assert connect.call_args.kwargs["use_pure"] is True
