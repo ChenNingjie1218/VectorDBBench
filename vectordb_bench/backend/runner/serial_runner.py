@@ -11,7 +11,7 @@ import numpy as np
 import psutil
 
 from vectordb_bench.backend.dataset import DatasetManager
-from vectordb_bench.backend.filter import Filter, FilterOp, non_filter
+from vectordb_bench.backend.filter import LABEL_FILTER_OPS, CohereLabelAndFilter, Filter, non_filter
 from vectordb_bench.backend.payload import PayloadProfile
 from vectordb_bench.backend.workload import WorkloadKind
 
@@ -110,24 +110,18 @@ class SerialInsertRunner:
                 log.debug(f"batch dataset size: {len(all_embeddings)}, {len(all_metadata)}")
 
                 labels_data = None
-                if self.filters.type == FilterOp.StrEqual:
+                if self.filters.type in LABEL_FILTER_OPS:
                     if self.dataset.data.scalar_labels_file_separated:
                         labels_data = self.dataset.scalar_labels[self.filters.label_field][all_metadata].to_list()
                     else:
                         labels_data = batch_df[self.filters.label_field].tolist()
 
-                insert_count, error = self.db.insert_embeddings(
-                    embeddings=all_embeddings,
-                    metadata=all_metadata,
-                    labels_data=labels_data,
-                )
+                insert_kwargs = {"embeddings": all_embeddings, "metadata": all_metadata, "labels_data": labels_data}
+                if isinstance(self.filters, CohereLabelAndFilter):
+                    insert_kwargs["extra_labels_data"] = self.filters.extra_labels_for_batch(all_metadata, labels_data)
+                insert_count, error = self.db.insert_embeddings(**insert_kwargs)
                 if error is not None:
-                    self.retry_insert(
-                        self.db,
-                        embeddings=all_embeddings,
-                        metadata=all_metadata,
-                        labels_data=labels_data,
-                    )
+                    self.retry_insert(self.db, **insert_kwargs)
 
                 assert insert_count == len(all_metadata)
                 count += insert_count

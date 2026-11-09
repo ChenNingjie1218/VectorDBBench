@@ -1,4 +1,5 @@
 from enum import StrEnum
+from typing import ClassVar, Literal
 
 from ..base import BaseModel
 
@@ -6,7 +7,11 @@ from ..base import BaseModel
 class FilterOp(StrEnum):
     NumGE = "NumGE"  # test ">="
     StrEqual = "Label"  # test "=="
+    LabelAnd = "LabelAnd"
     NonFilter = "NonFilter"
+
+
+LABEL_FILTER_OPS = frozenset({FilterOp.StrEqual, FilterOp.LabelAnd})
 
 
 class Filter(BaseModel):
@@ -91,3 +96,32 @@ class LabelFilter(Filter):
     @property
     def groundtruth_file(self) -> str:
         return f"neighbors_{self.label_field}_{self.label_value}.parquet"
+
+
+class CohereLabelAndFilter(LabelFilter):
+    """Two equivalent predicates over the published Cohere 1M label cohort."""
+
+    type: FilterOp = FilterOp.LabelAnd
+    label_conditions: Literal[1, 2]
+    extra_fields: ClassVar[tuple[str, str]] = ("label_b", "label_c")
+    match: ClassVar[str] = "yes"
+
+    def __init__(self, label_conditions: int):
+        super().__init__(label_percentage=0.01, label_conditions=label_conditions)
+
+    @property
+    def conditions(self) -> tuple[tuple[str, str], ...]:
+        if self.label_conditions == 1:
+            return ((self.label_field, self.label_value),)
+        return tuple((field, self.match) for field in self.extra_fields)
+
+    def extra_labels_for_batch(self, ids: list[int], labels: list[str]) -> dict[str, list[str]]:
+        left, right = [], []
+        label_value = self.label_value
+        for row_id, label in zip(ids, labels, strict=True):
+            # Assign deterministic, disjoint decoys outside the original 1% cohort.
+            bucket = ((row_id * 48271) % 2147483647) % 20
+            eligible = label == label_value
+            left.append(self.match if eligible or bucket == 0 else "no")
+            right.append(self.match if eligible or bucket == 1 else "no")
+        return dict(zip(self.extra_fields, (left, right), strict=True))

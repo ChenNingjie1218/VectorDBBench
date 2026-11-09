@@ -8,7 +8,7 @@ from typing import Any
 
 import mysql.connector as mysql
 
-from vectordb_bench.backend.filter import Filter, FilterOp
+from vectordb_bench.backend.filter import CohereLabelAndFilter, Filter, FilterOp
 
 from ..api import IndexType, VectorDB
 from .config import OceanBaseConfigDict, OceanBaseHNSWConfig
@@ -23,6 +23,7 @@ class OceanBase(VectorDB):
         FilterOp.NonFilter,
         FilterOp.NumGE,
         FilterOp.StrEqual,
+        FilterOp.LabelAnd,
     ]
     # mysql-connector cursor cannot be shared across threads
     thread_safe: bool = False
@@ -34,6 +35,8 @@ class OceanBase(VectorDB):
         db_case_config: OceanBaseHNSWConfig,
         collection_name: str = "items",
         drop_old: bool = False,
+        with_scalar_labels: bool = False,
+        extra_label_fields: tuple[str, ...] = (),
         **kwargs,
     ):
         self.name = "OceanBase"
@@ -45,10 +48,11 @@ class OceanBase(VectorDB):
         self._index_name = "vidx"
         self._primary_field = "id"
         self._vector_field = "embedding"
+        self._label_fields = ("labels", *extra_label_fields) if with_scalar_labels else ()
+        self.expr = ""
+        self.where_params = ()
 
-        log.info(
-            f"{self.name} initialized with config:\nDatabase: {self.db_config}\nCase Config: {self.db_case_config}"
-        )
+        log.info("OceanBase initialized for %s with case config %s", self.table_name, self.db_case_config)
 
         self._conn = None
         self._cursor = None
@@ -123,7 +127,10 @@ class OceanBase(VectorDB):
         partitions = getattr(self.db_case_config, "partitions", 0)
         log.info(f"Creating table {self.table_name} (partitions={partitions})")
 
-        create_table_query = f"CREATE TABLE {self.table_name} (id INT PRIMARY KEY, embedding VECTOR({self.dim}))"
+        label_sql = "".join(f", {field} VARCHAR(64) COLLATE utf8mb4_bin NOT NULL" for field in self._label_fields)
+        create_table_query = (
+            f"CREATE TABLE {self.table_name} (id INT PRIMARY KEY, embedding VECTOR({self.dim}){label_sql})"
+        )
         if partitions > 1:
             create_table_query += f" PARTITION BY KEY(id) PARTITIONS {partitions}"
         create_table_query += ";"
@@ -159,7 +166,10 @@ class OceanBase(VectorDB):
             self._wait_for_major_compaction()
 
             log.info("Gathering schema statistics...")
-            self._cursor.execute("CALL dbms_stats.gather_schema_stats('test', degree => 96);")
+            self._cursor.execute(
+                "CALL dbms_stats.gather_schema_stats(%s, degree => %s);",
+                (self.db_config["database"], self.db_case_config.create_index_parallel),
+            )
         except mysql.Error:
             log.exception("Failed to optimize index")
             raise
@@ -182,19 +192,38 @@ class OceanBase(VectorDB):
         self,
         embeddings: list[list[float]],
         metadata: list[int],
+        labels_data: list[str] | None = None,
+        extra_labels_data: dict[str, list[str]] | None = None,
         **kwargs: Any,
     ) -> tuple[int, Exception | None]:
         if not self._cursor:
             raise ValueError("Cursor is not initialized")
 
+        label_columns = {"labels": labels_data, **(extra_labels_data or {})}
+        if any(
+            label_columns.get(field) is None or len(label_columns[field]) != len(embeddings)
+            for field in self._label_fields
+        ):
+            raise ValueError("OceanBase label data must match the inserted embeddings")
+        fields = ", ".join(("id", "embedding", *self._label_fields))
         insert_count = 0
         try:
             for batch_start in range(0, len(embeddings), self.load_batch_size):
                 batch_end = min(batch_start + self.load_batch_size, len(embeddings))
-                batch = [(metadata[i], embeddings[i]) for i in range(batch_start, batch_end)]
-                values = ", ".join(f"({item_id}, '[{','.join(map(str, embedding))}]')" for item_id, embedding in batch)
-                self._cursor.execute(f"INSERT INTO {self.table_name} VALUES {values}")
-                insert_count += len(batch)
+                label_placeholders = ", %s" * len(self._label_fields)
+                values = ", ".join(
+                    f"({metadata[i]}, '[{','.join(map(str, embeddings[i]))}]'{label_placeholders})"
+                    for i in range(batch_start, batch_end)
+                )
+                sql = f"INSERT INTO {self.table_name} ({fields}) VALUES {values}"
+                if self._label_fields:
+                    params = tuple(
+                        label_columns[field][i] for i in range(batch_start, batch_end) for field in self._label_fields
+                    )
+                    self._cursor.execute(sql, params)
+                else:
+                    self._cursor.execute(sql)
+                insert_count += batch_end - batch_start
         except mysql.Error:
             log.exception("Failed to insert embeddings")
             raise
@@ -202,12 +231,21 @@ class OceanBase(VectorDB):
         return insert_count, None
 
     def prepare_filter(self, filters: Filter):
+        self.where_params = ()
         if filters.type == FilterOp.NonFilter:
             self.expr = ""
         elif filters.type == FilterOp.NumGE:
             self.expr = f"WHERE id >= {filters.int_value}"
-        elif filters.type == FilterOp.StrEqual:
-            self.expr = f"WHERE id == '{filters.label_value}'"
+        elif isinstance(filters, CohereLabelAndFilter) or filters.type == FilterOp.StrEqual:
+            conditions = (
+                filters.conditions
+                if isinstance(filters, CohereLabelAndFilter)
+                else ((filters.label_field, filters.label_value),)
+            )
+            if any(field not in self._label_fields for field, _ in conditions):
+                raise ValueError("OceanBase label filters require the corresponding label columns")
+            self.expr = "WHERE " + " AND ".join(f"{field} = %s" for field, _ in conditions)
+            self.where_params = tuple(value for _, value in conditions)
         else:
             msg = f"Not support Filter for Oceanbase - {filters}"
             raise ValueError(msg)
@@ -230,7 +268,10 @@ class OceanBase(VectorDB):
         )
 
         try:
-            self._cursor.execute(query_str)
+            if self.where_params:
+                self._cursor.execute(query_str, self.where_params)
+            else:
+                self._cursor.execute(query_str)
             return [row[0] for row in self._cursor.fetchall()]
         except mysql.Error:
             log.exception("Failed to execute search query")

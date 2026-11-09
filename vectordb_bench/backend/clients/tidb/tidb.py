@@ -10,7 +10,7 @@ from typing import Any
 import pymysql
 
 from ....metric import OptimizeResult
-from ...filter import Filter, FilterOp
+from ...filter import CohereLabelAndFilter, Filter, FilterOp
 from ..api import VectorDB
 from .config import SPFreshBuildMode, TiDBIndexConfig
 
@@ -32,7 +32,7 @@ class SPFreshIndexStatus:
 
 
 class TiDB(VectorDB):
-    supported_filter_types: list[FilterOp] = [FilterOp.NonFilter, FilterOp.NumGE, FilterOp.StrEqual]
+    supported_filter_types: list[FilterOp] = [FilterOp.NonFilter, FilterOp.NumGE, FilterOp.StrEqual, FilterOp.LabelAnd]
 
     def __init__(
         self,
@@ -42,6 +42,7 @@ class TiDB(VectorDB):
         collection_name: str = "vector_bench_test",
         drop_old: bool = False,
         with_scalar_labels: bool = False,
+        extra_label_fields: tuple[str, ...] = (),
         **kwargs,
     ):
         self.name = "TiDB"
@@ -51,6 +52,7 @@ class TiDB(VectorDB):
         self.dim = dim
         self.with_scalar_labels = with_scalar_labels
         self._scalar_label_field = "labels"
+        self._extra_label_fields = extra_label_fields
         self.conn = None  # To be inited by init()
         self.cursor = None  # To be inited by init()
         self._max_insert_commit_ts: int | None = None
@@ -97,7 +99,15 @@ class TiDB(VectorDB):
             index_sql = f",\n                        {self._spfresh_index_definition()}"
         scalar_label_sql = ""
         if self.with_scalar_labels:
-            scalar_label_sql = f",\n                        {self._scalar_label_field} VARCHAR(64) NOT NULL"
+            fields = (self._scalar_label_field, *self._extra_label_fields)
+            scalar_label_sql = ", " + ", ".join(
+                (
+                    f"{field} VARCHAR(64) COLLATE utf8mb4_bin NOT NULL"
+                    if self._extra_label_fields
+                    else f"{field} VARCHAR(64) NOT NULL"
+                )
+                for field in fields
+            )
 
         try:
             with self._get_connection() as (conn, cursor):
@@ -210,7 +220,8 @@ class TiDB(VectorDB):
 
     def _spfresh_index_definition(self) -> str:
         metric_fn = self.case_config.index_param()["metric_fn"]
-        storing_clause = f" STORING ({self._scalar_label_field})" if self.with_scalar_labels else ""
+        label_fields = ", ".join((self._scalar_label_field, *self._extra_label_fields))
+        storing_clause = f" STORING ({label_fields})" if self.with_scalar_labels else ""
         return (
             f"VECTOR INDEX {self._spfresh_index_name()} (({metric_fn}(embedding))) USING SPFRESH"
             f"{storing_clause}"
@@ -402,6 +413,7 @@ class TiDB(VectorDB):
         offset: int,
         size: int,
         labels_data: list[str] | None = None,
+        extra_labels_data: dict[str, list[str]] | None = None,
     ) -> int:
         if self.with_scalar_labels:
             if labels_data is None:
@@ -414,12 +426,15 @@ class TiDB(VectorDB):
                 buf = io.StringIO()
                 params: list[str] = []
                 if self.with_scalar_labels:
-                    buf.write(f"INSERT INTO {self.table_name} (id, embedding, {self._scalar_label_field}) VALUES ")
+                    fields = ", ".join(("id", "embedding", self._scalar_label_field, *self._extra_label_fields))
+                    buf.write(f"INSERT INTO {self.table_name} ({fields}) VALUES ")
+                    placeholders = ", %s" * (2 + len(self._extra_label_fields))
                     for i in range(offset, offset + size):
                         if i > offset:
                             buf.write(",")
-                        buf.write(f"({metadata[i]}, %s, %s)")
+                        buf.write(f"({metadata[i]}{placeholders})")
                         params.extend((str(embeddings[i]), labels_data[i]))
+                        params.extend(extra_labels_data[field][i] for field in self._extra_label_fields)
                     cursor.execute(buf.getvalue(), tuple(params))
                 else:
                     buf.write(f"INSERT INTO {self.table_name} (id, embedding) VALUES ")
@@ -442,6 +457,7 @@ class TiDB(VectorDB):
         embeddings: list[list[float]],
         metadata: list[int],
         labels_data: list[str] | None = None,
+        extra_labels_data: dict[str, list[str]] | None = None,
         **kwargs: Any,
     ) -> tuple[int, Exception]:
         if self.with_scalar_labels:
@@ -449,6 +465,12 @@ class TiDB(VectorDB):
                 raise ValueError("labels_data is required when with_scalar_labels=True")
             if len(labels_data) != len(embeddings):
                 raise ValueError("labels_data length must match embeddings length")
+
+        if any(
+            extra_labels_data is None or len(extra_labels_data.get(field, ())) != len(embeddings)
+            for field in self._extra_label_fields
+        ):
+            raise ValueError("TiDB AND label data must match the inserted embeddings")
 
         workers = 10
         batch_size = max(1, len(embeddings) // workers)
@@ -466,6 +488,7 @@ class TiDB(VectorDB):
                         offset,
                         size,
                         labels_data,
+                        **({"extra_labels_data": extra_labels_data} if self._extra_label_fields else {}),
                     )
                 else:
                     future = executor.submit(self._insert_embeddings_serial, embeddings, metadata, offset, size)
@@ -522,6 +545,11 @@ class TiDB(VectorDB):
                 raise ValueError(msg)
             self.where_clause = "WHERE id >= %s"
             self.where_params = (int(filters.int_value),)
+        elif isinstance(filters, CohereLabelAndFilter):
+            if not self.with_scalar_labels or self._extra_label_fields != filters.extra_fields:
+                raise ValueError("TiDB SPFRESH AND filters require all Cohere label columns")
+            self.where_clause = "WHERE " + " AND ".join(f"{field} = %s" for field, _ in filters.conditions)
+            self.where_params = tuple(value for _, value in filters.conditions)
         elif filters.type == FilterOp.StrEqual:
             if not self.with_scalar_labels:
                 raise ValueError("TiDB SPFRESH label filters require with_scalar_labels=True")

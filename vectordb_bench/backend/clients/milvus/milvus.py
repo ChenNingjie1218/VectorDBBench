@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 from pymilvus import DataType, Function, FunctionType, MilvusClient, MilvusException
 
-from vectordb_bench.backend.filter import Filter, FilterOp
+from vectordb_bench.backend.filter import CohereLabelAndFilter, Filter, FilterOp
 from vectordb_bench.backend.payload import PayloadProfile
 
 from ..api import VectorDB
@@ -41,6 +41,7 @@ class Milvus(VectorDB):
         FilterOp.NonFilter,
         FilterOp.NumGE,
         FilterOp.StrEqual,
+        FilterOp.LabelAnd,
     ]
     _use_bf16: bool = False
 
@@ -51,7 +52,7 @@ class Milvus(VectorDB):
     def has_text_field(self) -> bool:
         return bool(getattr(self, "_is_fts", False) and getattr(self, "_text_field", None))
 
-    def __init__(  # noqa: PLR0915
+    def __init__(  # noqa: PLR0912, PLR0915
         self,
         dim: int,
         db_config: dict,
@@ -60,6 +61,7 @@ class Milvus(VectorDB):
         drop_old: bool = False,
         name: str = "Milvus",
         with_scalar_labels: bool = False,
+        extra_label_fields: tuple[str, ...] = (),
         **kwargs,
     ):
         """Initialize wrapper around the milvus vector database."""
@@ -68,6 +70,7 @@ class Milvus(VectorDB):
         self.case_config = db_case_config
         self.collection_name = collection_name
         self.with_scalar_labels = with_scalar_labels
+        self._extra_label_fields = extra_label_fields
         collection_properties = kwargs.get("collection_properties", {})
 
         self._scalar_label_field = "label"
@@ -177,6 +180,8 @@ class Milvus(VectorDB):
                             max_length=256,
                             is_partition_key=is_partition_key and not self.multitenant_tenant_labels,
                         )
+                    for field in self._extra_label_fields:
+                        schema.add_field(field, DataType.VARCHAR, max_length=64)
 
             log.info(f"{self.name} create collection: {self.collection_name}")
 
@@ -274,6 +279,8 @@ class Milvus(VectorDB):
                 index_name=self._scalar_labels_index_name,
                 index_type="BITMAP",
             )
+            for field in self._extra_label_fields:
+                index_params.add_index(field_name=field, index_name=f"{field}_idx", index_type="BITMAP")
         return index_params
 
     def supports_multitenant(self) -> bool:
@@ -468,11 +475,18 @@ class Milvus(VectorDB):
         metadata: list[int],
         labels_data: list[str] | None = None,
         tenant_labels_data: list[str] | None = None,
+        extra_labels_data: dict[str, list[str]] | None = None,
         **kwargs,
     ) -> tuple[int, Exception]:
         """Insert one runner-provided batch of embeddings into Milvus."""
         assert self.client is not None
         assert len(embeddings) == len(metadata)
+
+        if extra_labels_data is not None and (
+            set(extra_labels_data) != set(self._extra_label_fields)
+            or any(len(values) != len(metadata) for values in extra_labels_data.values())
+        ):
+            raise ValueError("Milvus AND label data must match the inserted embeddings")
 
         vectors = _float32_to_bf16_bytes(embeddings) if self._use_bf16 else embeddings
         rows = []
@@ -486,6 +500,8 @@ class Milvus(VectorDB):
                 row[self._multitenant_partition_key_field] = tenant_labels_data[i]
             if self.with_scalar_labels:
                 row[self._scalar_payload_label_field] = labels_data[i]
+            if extra_labels_data is not None:
+                row.update((field, values[i]) for field, values in extra_labels_data.items())
             rows.append(row)
 
         try:
@@ -554,6 +570,13 @@ class Milvus(VectorDB):
             self.expr = ""
         elif filters.type == FilterOp.NumGE:
             self.expr = f"{self._scalar_id_field} >= {filters.int_value}"
+        elif isinstance(filters, CohereLabelAndFilter):
+            if not self.with_scalar_labels or self._extra_label_fields != filters.extra_fields:
+                raise ValueError("Milvus AND filters require all Cohere label columns")
+            self.expr = " and ".join(
+                f"{self._scalar_payload_label_field if field == filters.label_field else field} == '{value}'"
+                for field, value in filters.conditions
+            )
         elif filters.type == FilterOp.StrEqual:
             self.expr = f"{self._scalar_payload_label_field} == '{filters.label_value}'"
         else:

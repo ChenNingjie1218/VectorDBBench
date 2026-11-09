@@ -4,7 +4,16 @@ from enum import Enum, auto
 
 from vectordb_bench import config
 from vectordb_bench.backend.clients.api import MetricType
-from vectordb_bench.backend.filter import Filter, FilterOp, IntFilter, LabelFilter, NewIntFilter, NonFilter, non_filter
+from vectordb_bench.backend.filter import (
+    LABEL_FILTER_OPS,
+    CohereLabelAndFilter,
+    Filter,
+    IntFilter,
+    LabelFilter,
+    NewIntFilter,
+    NonFilter,
+    non_filter,
+)
 from vectordb_bench.backend.payload import FLOAT32_BYTES_PER_DIM, PayloadProfile
 from vectordb_bench.base import BaseModel
 from vectordb_bench.frontend.components.custom.getCustomConfig import CustomDatasetConfig
@@ -75,6 +84,7 @@ class CaseType(Enum):
     StreamingCustomDataset = 201
 
     LabelFilterPerformanceCase = 300
+    CohereLabelAndPerformanceCase = 301
 
     NewIntFilterPerformanceCase = 400
     CloudPayloadSearchCase = 500
@@ -155,7 +165,7 @@ class Case(BaseModel):
 
     @property
     def with_scalar_labels(self) -> bool:
-        return self.filters.type == FilterOp.StrEqual or self.payload_profile == PayloadProfile.SCALAR_LABEL
+        return self.filters.type in LABEL_FILTER_OPS or self.payload_profile == PayloadProfile.SCALAR_LABEL
 
     def check_scalar_labels(self) -> None:
         if self.with_scalar_labels and not self.dataset.data.with_scalar_labels:
@@ -916,6 +926,28 @@ class LabelFilterPerformanceCase(PerformanceCase):
         return LabelFilter(label_percentage=self.label_percentage)
 
 
+class CohereLabelAndPerformanceCase(PerformanceCase):
+    case_id: CaseType = CaseType.CohereLabelAndPerformanceCase
+    label_conditions: int
+
+    def __init__(self, label_conditions: int = 2):
+        dataset = DatasetWithSizeType.CohereMedium
+        filters = CohereLabelAndFilter(label_conditions=label_conditions)
+        super().__init__(
+            name=f"Cohere 1M Label-AND ({label_conditions} conditions, 1% matched)",
+            description="Cohere 1M search over the same 1% cohort with one or two equality predicates.",
+            dataset=dataset.get_manager(),
+            load_timeout=dataset.get_load_timeout(),
+            optimize_timeout=dataset.get_optimize_timeout(),
+            filter_rate=filters.filter_rate,
+            label_conditions=label_conditions,
+        )
+
+    @property
+    def filters(self) -> CohereLabelAndFilter:
+        return CohereLabelAndFilter(label_conditions=self.label_conditions)
+
+
 class FtsPerformanceCase(Case):
     """Base class for full-text search BM25 performance cases."""
 
@@ -1033,6 +1065,7 @@ type2case = {
     CaseType.StreamingCustomDataset: StreamingCustomDataset,
     CaseType.NewIntFilterPerformanceCase: NewIntFilterPerformanceCase,
     CaseType.LabelFilterPerformanceCase: LabelFilterPerformanceCase,
+    CaseType.CohereLabelAndPerformanceCase: CohereLabelAndPerformanceCase,
     CaseType.CloudPayloadSearchCase: CloudPayloadSearchCase,
     CaseType.Performance: Performance,
     CaseType.FTSBm25Performance: FTSBm25Performance,

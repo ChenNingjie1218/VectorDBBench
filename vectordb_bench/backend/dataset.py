@@ -34,7 +34,7 @@ from vectordb_bench.base import BaseModel
 from . import utils
 from .clients import MetricType
 from .data_source import DatasetReader, DatasetSource
-from .filter import Filter, FilterOp, NewIntFilter, non_filter
+from .filter import LABEL_FILTER_OPS, CohereLabelAndFilter, Filter, FilterOp, NewIntFilter, non_filter
 
 log = logging.getLogger(__name__)
 DEFAULT_INSERT_BATCH_SIZE = config.DEFAULT_INSERT_BATCH_SIZE
@@ -607,11 +607,22 @@ class ParquetDatasetManager(DatasetManager):
             msg = f"Ground truth selector {gt_file!r} resolved to multiple files"
             raise ValueError(msg)
         resolved_gt_file = resolved_gt_files[0] if resolved_gt_files else None
-        needs_scalar_labels = filters.type == FilterOp.StrEqual or with_scalar_labels
+        needs_scalar_labels = filters.type in LABEL_FILTER_OPS or with_scalar_labels
 
         # read scalar_labels_file if separated
         if needs_scalar_labels and self.data.with_scalar_labels and self.data.scalar_labels_file_separated:
             self.scalar_labels = self._read_file(self.data.scalar_labels_file)
+            if isinstance(filters, CohereLabelAndFilter):
+                labels = self.scalar_labels
+                ids = labels.get_column(self.data.train_id_field)
+                if len(ids) != self.data.size or not ids.equals(
+                    pl.int_range(self.data.size, eager=True, dtype=ids.dtype)
+                ):
+                    raise ValueError("Cohere label rows must be ordered by contiguous training ID")
+                matches = (labels.get_column(filters.label_field) == filters.label_value).sum()
+                if matches != 10_000:
+                    msg = f"Cohere 1M label cohort must contain 10,000 IDs, got {matches}"
+                    raise ValueError(msg)
 
         if resolved_gt_file is not None and test_files:
             query_frames = [self._read_file(file) for file in test_files]

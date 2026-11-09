@@ -221,7 +221,9 @@ def _get_performance_case_config(parameters: dict) -> dict:
     return {"dataset_name": dataset_name}
 
 
-def get_custom_case_config(parameters: dict) -> dict:
+def get_custom_case_config(parameters: dict) -> dict:  # noqa: PLR0912
+    if parameters["case_type"] == "CohereLabelAndPerformanceCase":
+        return {"label_conditions": parameters["label_conditions"]}
     if parameters["case_type"] == "Performance":
         return _get_performance_case_config(parameters)
     custom_case_config = {}
@@ -719,6 +721,15 @@ class CommonTypedDict(TypedDict):
             help="Filter rate for LabelFilterPerformanceCase",
             default=0.01,
             show_default=True,
+        ),
+    ]
+    label_conditions: Annotated[
+        int,
+        click.option(
+            "--label-conditions",
+            type=click.IntRange(1, 2),
+            default=2,
+            help="Number of equality predicates in CohereLabelAndPerformanceCase.",
         ),
     ]
     payload_profile: Annotated[

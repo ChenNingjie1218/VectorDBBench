@@ -16,7 +16,7 @@ from . import utils
 from .cases import Case, CaseLabel, StreamingPerformanceCase
 from .clients import DB, MetricType, api
 from .data_source import DatasetSource
-from .filter import FilterOp
+from .filter import CohereLabelAndFilter, FilterOp
 from .payload import FLOAT32_BYTES_PER_DIM
 from .runner import (
     ColdWarmSearchRunner,
@@ -223,6 +223,11 @@ class CaseRunner(BaseModel):
             collection_name = db_config_dict.pop("collection_name")
 
         extra_db_kwargs = {}
+        if isinstance(self.ca.filters, CohereLabelAndFilter):
+            if FilterOp.LabelAnd not in db_cls.supported_filter_types:
+                msg = f"{self.config.db.value} does not support Cohere label AND"
+                raise ValueError(msg)
+            extra_db_kwargs["extra_label_fields"] = CohereLabelAndFilter.extra_fields
         if collection_name:
             extra_db_kwargs["collection_name"] = collection_name
         if self.ca.is_multitenant:

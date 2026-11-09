@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from vectordb_bench.backend.filter import Filter, FilterOp, non_filter
+from vectordb_bench.backend.filter import LABEL_FILTER_OPS, CohereLabelAndFilter, Filter, non_filter
 from vectordb_bench.backend.utils import kill_proc_tree, time_it, timeout
 from vectordb_bench.backend.workload import WorkloadKind
 
@@ -187,8 +187,8 @@ class ConcurrentInsertRunner:
         del emb_np
 
         labels_data = None
-        if self.filters.type == FilterOp.StrEqual or self.with_scalar_labels:
-            label_field = self.filters.label_field if self.filters.type == FilterOp.StrEqual else "labels"
+        if self.filters.type in LABEL_FILTER_OPS or self.with_scalar_labels:
+            label_field = self.filters.label_field if self.filters.type in LABEL_FILTER_OPS else "labels"
             if self.dataset.data.scalar_labels_file_separated:
                 labels_data = self.dataset.scalar_labels[label_field][all_metadata].to_list()
             else:
@@ -205,6 +205,8 @@ class ConcurrentInsertRunner:
         }
         if tenant_labels_data is not None:
             insert_kwargs["tenant_labels_data"] = tenant_labels_data
+        if isinstance(self.filters, CohereLabelAndFilter):
+            insert_kwargs["extra_labels_data"] = self.filters.extra_labels_for_batch(all_metadata, labels_data)
         return insert_kwargs
 
     def _next_fts_batch(self) -> dict | None:
