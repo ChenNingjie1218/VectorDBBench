@@ -86,7 +86,7 @@ class TiDBSPFreshTypedDict(TiDBTypedDict):
         click.option(
             "--spfresh-build-mode",
             type=click.Choice(["inline", "non-inline"]),
-            default="inline",
+            default="non-inline",
             show_default=True,
             help="Create the SPFresh index with the table or after loading the data",
         ),

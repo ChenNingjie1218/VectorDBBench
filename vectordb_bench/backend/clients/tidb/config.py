@@ -67,7 +67,7 @@ class SPFreshBuildMode(StrEnum):
 
 
 class TiDBSPFreshIndexConfig(TiDBIndexConfig):
-    spfresh_build_mode: SPFreshBuildMode = SPFreshBuildMode.INLINE
+    spfresh_build_mode: SPFreshBuildMode = SPFreshBuildMode.NON_INLINE
     spfresh_wait_timeout: float = Field(default=600.0, gt=0, allow_inf_nan=False)
     min_partition_size: int | None = Field(default=None, ge=1)
     max_partition_size: int | None = Field(default=None, ge=2)

@@ -633,7 +633,7 @@ Run `vectordbbench tidbspfresh --help` to list all options.
 
 | Option | Behavior |
 | --- | --- |
-| `--spfresh-build-mode inline\|non-inline` | Defaults to `inline`: create the index with the empty table. `non-inline` creates it after loading rows. |
+| `--spfresh-build-mode inline\|non-inline` | Defaults to `non-inline`: create the index after loading rows. `inline` creates it with the empty table. |
 | `--min-partition-size`, `--max-partition-size` | Partition size bounds, applied only when creating the index. |
 | `--write-beam-size` | Write routing beam size, applied only when creating the index. |
 | `--search-beam-size` | Search beam size. |
