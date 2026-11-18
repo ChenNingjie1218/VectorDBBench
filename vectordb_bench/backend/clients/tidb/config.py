@@ -89,6 +89,8 @@ class TiDBIndexConfig(BaseModel, DBCaseConfig):
             return "vec_l2_distance"
         if self.metric_type == MetricType.COSINE:
             return "vec_cosine_distance"
+        if self.metric_type == MetricType.IP:
+            return "vec_negative_inner_product"
         msg = f"Unsupported metric type: {self.metric_type}"
         raise ValueError(msg)
 

@@ -76,7 +76,11 @@ class FakeDataset:
         )
 
 
-def make_tidb(dim: int = 3, with_scalar_labels: bool = False) -> TiDB:
+def make_tidb(
+    dim: int = 3,
+    with_scalar_labels: bool = False,
+    metric_type: MetricType = MetricType.L2,
+) -> TiDB:
     return TiDB(
         dim=dim,
         db_config={
@@ -88,12 +92,56 @@ def make_tidb(dim: int = 3, with_scalar_labels: bool = False) -> TiDB:
             "ssl_verify_cert": False,
             "ssl_verify_identity": False,
         },
-        db_case_config=TiDBIndexConfig(metric_type=MetricType.L2),
+        db_case_config=TiDBIndexConfig(metric_type=metric_type),
         with_scalar_labels=with_scalar_labels,
     )
 
 
 class TestTiDBSPFresh:
+    @pytest.mark.parametrize(
+        "metric_type, metric_fn",
+        [
+            (MetricType.L2, "vec_l2_distance"),
+            (MetricType.COSINE, "vec_cosine_distance"),
+            (MetricType.IP, "vec_negative_inner_product"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "filters, where_clause, params",
+        [
+            (None, "", None),
+            (IntFilter(filter_rate=0.01, int_field="id", int_value=100), "WHERE id >= %s", (100,)),
+            (LabelFilter(label_percentage=0.01), "WHERE labels = %s", ("label_1p",)),
+        ],
+    )
+    def test_index_and_search_use_the_same_metric(self, metric_type, metric_fn, filters, where_clause, params):
+        tidb = make_tidb(metric_type=metric_type, with_scalar_labels=isinstance(filters, LabelFilter))
+        tidb.cursor = FakeCursor()
+        tidb.conn = FakeConnection()
+
+        tidb._create_spfresh_index()
+
+        index_sql, _ = tidb.cursor.execute_calls[-1]
+        assert (
+            f"ALTER TABLE vector_bench_test ADD VECTOR INDEX idx_embedding_spfresh_{metric_type.value.lower()} "
+            f"(({metric_fn}(embedding))) USING SPFRESH"
+        ) in index_sql
+        assert tidb.conn.committed
+
+        if filters is not None:
+            tidb.prepare_filter(filters)
+        # Keep the non-unit query unchanged: normalization would alter IP semantics.
+        assert tidb.search_embedding(query=[3.0, 4.0, 0.0], k=10) == [1, 2]
+
+        search_sql, search_params = tidb.cursor.execute_calls[-1]
+        assert " ".join(search_sql.split()) == " ".join(
+            (
+                f"SELECT id FROM vector_bench_test {where_clause} "
+                f'ORDER BY {metric_fn}(embedding, "[3.0, 4.0, 0.0]") LIMIT 10;'
+            ).split()
+        )
+        assert search_params == params
+
     def test_supports_numeric_and_label_filters(self):
         numeric_filter = IntFilter(filter_rate=0.01, int_field="id", int_value=100)
         label_filter = LabelFilter(label_percentage=0.01)
