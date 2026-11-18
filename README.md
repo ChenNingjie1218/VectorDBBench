@@ -656,7 +656,8 @@ They require an existing, ready SPFresh index and skip loading, index creation, 
 Search settings are persisted on the index, so run parameter sweeps sequentially against the same index.
 YAML batches use `tidbspfresh` as the command key and underscore option names such as `search_beam_size`.
 
-The dataset selects L2 or cosine distance. Numeric (`id >= ...`) and label equality cases are supported;
+The dataset selects L2, cosine, or inner product (IP). IP uses `vec_negative_inner_product` with
+ascending ordering and preserves the original vectors. Numeric (`id >= ...`) and label equality cases are supported;
 label cases store the `labels` column in the vector index. Both build modes use the standard load and
 search stages. `--payload-profile scalar_label` returns both IDs and labels; label filtering also works
 with the default ID-only response. After loading, the client waits for a ready index whose checkpoint

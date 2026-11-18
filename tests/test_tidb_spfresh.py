@@ -76,7 +76,7 @@ def make_search_case(*, case_id=CaseType.Performance768D1M, custom=None, profile
         stages=["search_serial", "search_concurrent"],
     )
     runner = Assembler.assemble_all("test", "test", [task], DatasetSource.S3).case_runners[0]
-    runner.ca.dataset.test_data = [[1.0, 0.0]]
+    runner.ca.dataset.test_data = [[3.0, 4.0]]
     runner.ca.dataset.gt_data = [[7, 9, 11]]
     runner.init_db(drop_old=False)
     return runner
@@ -112,9 +112,16 @@ def test_original_tidb_still_creates_tiflash_index_and_uses_tiflash_optimize(mon
     assert not TiDB.filter_supported(IntFilter(int_value=5))
 
 
-@pytest.mark.parametrize("metric", [MetricType.L2, MetricType.COSINE])
+@pytest.mark.parametrize(
+    "metric,metric_fn",
+    [
+        (MetricType.L2, "vec_l2_distance"),
+        (MetricType.COSINE, "vec_cosine_distance"),
+        (MetricType.IP, "vec_negative_inner_product"),
+    ],
+)
 @pytest.mark.parametrize("mode", ["inline", "non-inline"])
-def test_spfresh_ddl_and_checkpoint_barrier(monkeypatch, metric, mode):
+def test_spfresh_ddl_and_checkpoint_barrier(monkeypatch, metric, metric_fn, mode):
     param = (
         "min_partition_size=64,max_partition_size=512,write_beam_size=8,"
         "search_beam_size=174,oversample_factor=1.25,hamming_factor=96,rabitq4_factor=4"
@@ -145,6 +152,7 @@ def test_spfresh_ddl_and_checkpoint_barrier(monkeypatch, metric, mode):
     assert len(ddl) == 1
     assert "STORING (labels) VECTOR_INDEX_PARAM %s" in ddl[0].args[0]
     assert f"idx_embedding_spfresh_{metric.value.lower()}" in ddl[0].args[0]
+    assert f"(({metric_fn}(embedding))) USING SPFRESH" in ddl[0].args[0]
     assert ddl[0].args[1] == (param,)
     assert not any("ALTER INDEX" in call.args[0] for call in calls)
     assert not any("DROP INDEX" in call.args[0] or "tiflash" in call.args[0].lower() for call in calls)
@@ -299,14 +307,28 @@ def test_standard_concurrent_runner_loads_labels_without_exporting_state(monkeyp
     "filters,expected",
     [(non_filter, ()), (IntFilter(int_value=42), (42,)), (LabelFilter(label_percentage=0.01), ("label_1p",))],
 )
-def test_search_binds_filters_and_can_reset_them(filters, expected):
-    client = make_client(labels=True)
+@pytest.mark.parametrize(
+    "metric,metric_fn",
+    [
+        (MetricType.L2, "vec_l2_distance"),
+        (MetricType.COSINE, "vec_cosine_distance"),
+        (MetricType.IP, "vec_negative_inner_product"),
+    ],
+)
+@pytest.mark.parametrize("profile", [PayloadProfile.IDS_ONLY, PayloadProfile.SCALAR_LABEL])
+def test_search_binds_filters_and_can_reset_them(filters, expected, metric, metric_fn, profile):
+    client = make_client(labels=True, metric=metric)
     client.cursor = Mock()
-    client.cursor.fetchall.return_value = [("7",), (9,)]
+    client.cursor.fetchall.return_value = (
+        [("7", "label_1p"), (9, "label_10p")] if profile == PayloadProfile.SCALAR_LABEL else [("7",), (9,)]
+    )
     client.prepare_filter(filters)
-    assert client.search_embedding([1, 0], k=2) == [7, 9]
+    assert client.search_embedding([3.0, 4.0], k=2, payload_profile=profile) == [7, 9]
     sql, params = client.cursor.execute.call_args.args
-    assert params == (*expected, "[1, 0]", 2)
+    assert params == (*expected, "[3.0, 4.0]", 2)
+    columns = "id, labels" if profile == PayloadProfile.SCALAR_LABEL else "id"
+    assert sql.startswith(f"SELECT {columns} FROM ")
+    assert f"ORDER BY {metric_fn}(embedding, %s) LIMIT %s" in sql
     assert ("WHERE" in sql) == bool(expected)
     client.prepare_filter(non_filter)
     client.search_embedding([1, 0])
@@ -319,6 +341,23 @@ def test_search_binds_filters_and_can_reset_them(filters, expected):
     [
         (CaseType.Performance768D1M, {}),
         (
+            CaseType.PerformanceCustomDataset,
+            {
+                "name": "ip-test",
+                "description": "",
+                "load_timeout": 10,
+                "optimize_timeout": 10,
+                "dataset_config": {
+                    "name": "ip-test",
+                    "dir": "/tmp/ip-test",
+                    "size": 3,
+                    "dim": 2,
+                    "metric_type": "IP",
+                    "file_count": 1,
+                },
+            },
+        ),
+        (
             CaseType.NewIntFilterPerformanceCase,
             {"dataset_with_size_type": "Medium Cohere (768dim, 1M)", "filter_rate": 0.99},
         ),
@@ -330,6 +369,8 @@ def test_search_binds_filters_and_can_reset_them(filters, expected):
 )
 def test_search_uses_standard_runners_and_payload_without_plan_checks(monkeypatch, profile, case_id, custom):
     runner = make_search_case(case_id=case_id, custom=custom, profile=profile)
+    assert runner.ca.payload_profile == profile
+    assert not runner.normalize
     _, cursor = mock_connection(monkeypatch, runner.db)
     runner._init_search_runners()
     cursor.execute.assert_not_called()
@@ -340,12 +381,15 @@ def test_search_uses_standard_runners_and_payload_without_plan_checks(monkeypatc
     for search_runner in (runner.serial_search_runner, runner.search_runner):
         with runner.db.init():
             runner.db.prepare_filter(runner.ca.filters)
-            assert search_runner._search_embedding([1.0, 0.0]) == [7, 9]
+            assert search_runner._search_embedding(search_runner.test_data[0]) == [7, 9]
         sql, params = cursor.execute.call_args.args
         columns = "id, labels" if profile == PayloadProfile.SCALAR_LABEL else "id"
         assert sql.startswith(f"SELECT {columns} FROM ")
         assert "EXPLAIN" not in sql and "USE INDEX" not in sql and "FORCE INDEX" not in sql
-        assert params[-2:] == ("[1.0, 0.0]", 3)
+        assert params[-2:] == ("[3.0, 4.0]", 3)
+        if case_id == CaseType.PerformanceCustomDataset:
+            assert runner.db.case_config.metric_type == MetricType.IP
+            assert "ORDER BY vec_negative_inner_product(embedding, %s) LIMIT %s" in sql
         if case_id == CaseType.LabelFilterPerformanceCase:
             assert "WHERE labels = %s" in sql
             assert params[0] == "label_1p"

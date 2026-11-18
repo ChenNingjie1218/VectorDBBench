@@ -77,6 +77,11 @@ class TiDBSPFreshIndexConfig(TiDBIndexConfig):
     hamming_factor: int | None = Field(default=None, ge=1, le=256)
     rabitq4_factor: int | None = Field(default=None, ge=1, le=256)
 
+    def get_metric_fn(self) -> str:
+        if self.metric_type == MetricType.IP:
+            return "vec_negative_inner_product"
+        return super().get_metric_fn()
+
     @model_validator(mode="after")
     def validate_parameter_pairs(self):
         # Unspecified values come from the server (or the existing index).

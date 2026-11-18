@@ -463,6 +463,7 @@ class PerformanceCustomDataset(PerformanceCase):
             use_filter=use_filter,
             label_percentage=label_percentage,
             filter_rate=filter_rate,
+            **kwargs,
         )
 
     @property
