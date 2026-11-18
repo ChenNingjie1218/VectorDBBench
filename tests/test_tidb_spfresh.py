@@ -7,16 +7,20 @@ import pandas as pd
 import pytest
 
 from vectordb_bench.backend.clients import DB
+from vectordb_bench.backend.assembler import Assembler
 from vectordb_bench.backend.clients.api import MetricType
-from vectordb_bench.backend.clients.tidb.config import TiDBIndexConfig
+from vectordb_bench.backend.clients.tidb.config import TiDBConfig, TiDBIndexConfig
 from vectordb_bench.backend.clients.tidb.tidb import (
     MAX_ALLOWED_PACKET_BYTES,
     SPFreshIndexStatus,
     TiDB,
 )
 from vectordb_bench.backend.filter import IntFilter, LabelFilter
+from vectordb_bench.backend.data_source import DatasetSource
+from vectordb_bench.backend.payload import PayloadProfile
 from vectordb_bench.backend.runner import SerialInsertRunner
 from vectordb_bench.backend.task_runner import CaseRunner
+from vectordb_bench.models import CaseConfig, CaseType, TaskConfig
 
 
 class FakeCursor:
@@ -114,8 +118,12 @@ class TestTiDBSPFresh:
             (LabelFilter(label_percentage=0.01), "WHERE labels = %s", ("label_1p",)),
         ],
     )
-    def test_index_and_search_use_the_same_metric(self, metric_type, metric_fn, filters, where_clause, params):
-        tidb = make_tidb(metric_type=metric_type, with_scalar_labels=isinstance(filters, LabelFilter))
+    @pytest.mark.parametrize("profile", [PayloadProfile.IDS_ONLY, PayloadProfile.SCALAR_LABEL])
+    def test_index_and_search_use_the_same_metric(self, metric_type, metric_fn, filters, where_clause, params, profile):
+        tidb = make_tidb(
+            metric_type=metric_type,
+            with_scalar_labels=isinstance(filters, LabelFilter) or profile == PayloadProfile.SCALAR_LABEL,
+        )
         tidb.cursor = FakeCursor()
         tidb.conn = FakeConnection()
 
@@ -131,16 +139,75 @@ class TestTiDBSPFresh:
         if filters is not None:
             tidb.prepare_filter(filters)
         # Keep the non-unit query unchanged: normalization would alter IP semantics.
-        assert tidb.search_embedding(query=[3.0, 4.0, 0.0], k=10) == [1, 2]
+        rows = [(1, "label_1p"), (2, "label_10p")] if profile == PayloadProfile.SCALAR_LABEL else [(1,), (2,)]
+        with patch.object(tidb.cursor, "fetchall", return_value=rows) as fetchall:
+            assert tidb.search_embedding(query=[3.0, 4.0, 0.0], k=10, payload_profile=profile) == [1, 2]
+            fetchall.assert_called_once()
 
         search_sql, search_params = tidb.cursor.execute_calls[-1]
+        columns = "id, labels" if profile == PayloadProfile.SCALAR_LABEL else "id"
         assert " ".join(search_sql.split()) == " ".join(
             (
-                f"SELECT id FROM vector_bench_test {where_clause} "
+                f"SELECT {columns} FROM vector_bench_test {where_clause} "
                 f'ORDER BY {metric_fn}(embedding, "[3.0, 4.0, 0.0]") LIMIT 10;'
             ).split()
         )
         assert search_params == params
+
+    def test_invalid_payload_is_rejected_before_query(self):
+        tidb = make_tidb()
+        tidb.cursor = FakeCursor()
+        with pytest.raises(ValueError, match="requires a table with scalar labels"):
+            tidb.search_embedding([3.0, 4.0, 0.0], payload_profile=PayloadProfile.SCALAR_LABEL)
+        with pytest.raises(ValueError, match="Unsupported.*payload"):
+            tidb.search_embedding([3.0, 4.0, 0.0], payload_profile=PayloadProfile.VECTOR)
+        assert tidb.cursor.execute_calls == []
+
+    @pytest.mark.parametrize("profile", [PayloadProfile.IDS_ONLY, PayloadProfile.SCALAR_LABEL])
+    def test_custom_dataset_payload_reaches_standard_search_runners(self, profile):
+        task = TaskConfig(
+            db=DB.TiDB,
+            db_config=TiDBConfig(password=""),
+            db_case_config=TiDBIndexConfig(),
+            case_config=CaseConfig(
+                case_id=CaseType.PerformanceCustomDataset,
+                payload_profile=profile,
+                k=3,
+                custom_case={
+                    "name": "ip-payload-test",
+                    "description": "",
+                    "load_timeout": 10,
+                    "optimize_timeout": 10,
+                    "dataset_config": {
+                        "name": "ip-payload-test",
+                        "dir": "/tmp/ip-payload-test",
+                        "size": 3,
+                        "dim": 3,
+                        "metric_type": "IP",
+                        "file_count": 1,
+                    },
+                },
+            ),
+            stages=["search_serial", "search_concurrent"],
+        )
+        runner = Assembler.assemble_all("test", "test", [task], DatasetSource.S3).case_runners[0]
+        assert runner.ca.payload_profile == profile
+        runner._validate_vector_payload_profile()
+        runner.ca.dataset.test_data = [[3.0, 4.0, 0.0]]
+        runner.ca.dataset.gt_data = [[1, 2]]
+        runner.init_db(drop_old=False)
+        assert runner.db.with_scalar_labels == (profile == PayloadProfile.SCALAR_LABEL)
+        runner.db.cursor = FakeCursor()
+        runner._init_search_runners()
+        rows = [(1, "label_1p"), (2, "label_10p")] if profile == PayloadProfile.SCALAR_LABEL else [(1,), (2,)]
+        for search_runner in (runner.serial_search_runner, runner.search_runner):
+            with patch.object(runner.db.cursor, "fetchall", return_value=rows) as fetchall:
+                assert search_runner._search_embedding(search_runner.test_data[0]) == [1, 2]
+                fetchall.assert_called_once()
+            sql, _ = runner.db.cursor.execute_calls[-1]
+            columns = "id, labels" if profile == PayloadProfile.SCALAR_LABEL else "id"
+            assert f"SELECT {columns} FROM " in sql
+            assert 'ORDER BY vec_negative_inner_product(embedding, "[3.0, 4.0, 0.0]")' in sql
 
     def test_supports_numeric_and_label_filters(self):
         numeric_filter = IntFilter(filter_rate=0.01, int_field="id", int_value=100)
@@ -522,14 +589,9 @@ class TestTiDBSPFresh:
             result = tidb.build_spfresh_index()
 
         executed_sql = [sql for sql, _ in tidb.cursor.execute_calls]
-        assert executed_sql[0] == (
-            "DROP INDEX IF EXISTS idx_embedding_spfresh_l2 ON vector_bench_test"
-        )
+        assert executed_sql[0] == ("DROP INDEX IF EXISTS idx_embedding_spfresh_l2 ON vector_bench_test")
         assert "ALTER TABLE vector_bench_test ADD VECTOR INDEX idx_embedding_spfresh_l2" in executed_sql[1]
-        assert (
-            "VECTOR_INDEX_PARAM 'min_partition_size=32,max_partition_size=256,write_beam_size=8'"
-            in executed_sql[1]
-        )
+        assert "VECTOR_INDEX_PARAM 'min_partition_size=32,max_partition_size=256,write_beam_size=8'" in executed_sql[1]
         assert result.optimize_duration == 0.0
         assert result.spfresh_build_duration == 3.5
         assert result.spfresh_incremental_catchup_duration == 0.0

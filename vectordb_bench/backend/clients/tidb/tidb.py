@@ -11,6 +11,7 @@ import pymysql
 
 from ....metric import OptimizeResult
 from ...filter import Filter, FilterOp
+from ...payload import PayloadProfile
 from ..api import VectorDB
 from .config import SPFreshBuildMode, TiDBIndexConfig
 
@@ -33,6 +34,10 @@ class SPFreshIndexStatus:
 
 class TiDB(VectorDB):
     supported_filter_types: list[FilterOp] = [FilterOp.NonFilter, FilterOp.NumGE, FilterOp.StrEqual]
+
+    @staticmethod
+    def supports_payload_profile(payload_profile: PayloadProfile) -> bool:
+        return payload_profile in {PayloadProfile.IDS_ONLY, PayloadProfile.SCALAR_LABEL}
 
     def __init__(
         self,
@@ -540,10 +545,17 @@ class TiDB(VectorDB):
         k: int = 100,
         filters: dict | None = None,
         timeout: int | None = None,
+        payload_profile: PayloadProfile = PayloadProfile.IDS_ONLY,
         **kwargs: Any,
     ) -> list[int]:
+        if not self.supports_payload_profile(payload_profile):
+            msg = f"Unsupported TiDB SPFresh payload profile: {payload_profile}"
+            raise ValueError(msg)
+        if payload_profile == PayloadProfile.SCALAR_LABEL and not self.with_scalar_labels:
+            raise ValueError("scalar_label payload requires a table with scalar labels")
+        columns = f"id, {self._scalar_label_field}" if payload_profile == PayloadProfile.SCALAR_LABEL else "id"
         sql = f"""
-            SELECT id FROM {self.table_name} {self.where_clause}
+            SELECT {columns} FROM {self.table_name} {self.where_clause}
             ORDER BY {self.search_fn}(embedding, "{query!s}") LIMIT {k};
             """
         if self.where_params:
